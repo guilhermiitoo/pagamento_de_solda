@@ -1633,7 +1633,9 @@ const DB={
     }catch(e){setSync('Erro ao ler');return false;}finally{DB.pulling=false;}
   },
   // Garante banco fresco antes de uma operação crítica (requisição, correção, limpeza)
-  async pullNow(){for(let i=0;i<20&&(DB.writing||DB.pending);i++)await sleep(50);await DB.pull(true);}
+  // (v12.3) também espera uma leitura em andamento terminar — antes, se o ciclo de 2s
+  // estivesse lendo, pull() voltava sem ler nada e a requisição usava o banco velho.
+  async pullNow(){for(let i=0;i<40&&(DB.writing||DB.pending||DB.pulling);i++)await sleep(50);await DB.pull(true);}
 };
 
 // ── MERGE por delta: aplica no disco só o que ESTA máquina mudou desde a última leitura ──
