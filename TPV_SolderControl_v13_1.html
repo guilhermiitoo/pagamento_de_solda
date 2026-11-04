@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>TPV – Controle de Pagamento de Solda v13.0</title>
+<title>TPV – Controle de Pagamento de Solda v13.1</title>
 <!-- v12.0: 100% OFFLINE. Nenhum recurso é buscado na internet.
      A política abaixo bloqueia qualquer tentativa de acesso externo (http/https),
      mesmo que algum trecho futuro tente. Fonte, gráficos e leitor de planilha
@@ -1499,8 +1499,23 @@ textarea.fc{resize:vertical;min-height:75px;}
        antigo é copiado para dados/banco/bak/ e não é mais usado.
      - Corrigido: alteração ainda não gravada podia ser apagada pelo sync de 2s
        (janela de 60ms entre uma gravação e a próxima).
+   v13.1 (04/11/2026) — engenharia de salvamento do Spare Parts v17.55 (sem servidor)
+     - Pasta só é aceita com o arquivo SOLDA_PASTA_DO_SISTEMA.json ({"sistema":"SOLDA_MMT"}),
+       colocado à mão. Sem ele a pasta é recusada e nada é criado.
+     - Domínios: estoque_tubos.json, solicitacoes.json, usuarios.json, config.json.
+     - Merge de 3 vias POR REGISTRO (base · memória · disco). O conflito é checado no TUBO,
+       não só no ID da solicitação. Quem gravou primeiro ganha.
+     - Duas líderes no mesmo tubo: a segunda recebe o próximo tubo livre e o aviso
+       "O tubo X já tinha sido reservado por FULANO às hh:mm. Você ficou com o tubo Y".
+     - Dois PCs na mesma operação (ex.: entregar o mesmo pedido): o segundo é desfeito e avisado.
+     - Gravação: ler -> juntar -> trava -> conferir token -> gravar -> índice por último (5x).
+       Nunca mostra OK sem ter gravado.
+     - PC sem rede (Wi-Fi): faixa "SEM CONEXÃO"; a solicitação fica PENDENTE neste PC
+       ("NÃO enviada") e, quando a rede volta, é conferida com o estoque atual (tubo trocado,
+       quantidade reduzida ou cancelada, com aviso). Mais de 10 min sem rede: a líder confirma.
+     - Migração automática: o JSON antigo da pasta vira <nome>_MIGRADO_<data>.bak.
    ═══════════════════════════════════════════════════════════════ */
-const VERSAO='v13.0';
+const VERSAO='v13.1';
 
 // ═══ DATABASE ═══
 let dbHandle=null, db=null, cu=null, _syncInt=null, _clockInt=null, _tab='';
@@ -1556,46 +1571,56 @@ function normalizarDB(d){
 }
 
 // ══════════════════════════════════════════════════════════════════════
-// v13.0 — BANCO EM PASTA (mesmo motor do Spare Parts v17.52)
+// v13.1 — ENGENHARIA DE SALVAMENTO (mesma do Spare Parts v17.55)
+// Cada PC grava DIRETO na pasta. Sem servidor, sem fila de pedidos.
 //
-//   <pasta escolhida>/
-//     SOLDA_PASTA_DO_SISTEMA.json   <- confirmação: recusa pasta errada
-//     dados/banco/indice.json       <- manifesto (~1KB). O sync de 2s lê SÓ ele.
-//     dados/banco/estoque.json      <- estoque FIFO, tubos em uso, sequência FIFO
-//     dados/banco/solicitacoes.json <- pedidos das líderes (com as reservas)
-//     dados/banco/usuarios.json     <- usuários, modelos, linhas, identidade do banco
-//     dados/banco/config.json       <- correções, limpezas, plano do WH, demais campos
-//     dados/banco/bak/*.bak         <- cópia anterior de cada arquivo (máx. 1 a cada 5 min)
-//     dados/banco/.lock             <- trava de gravação {id, pc, ts}
-//     dados/movimentos/AAAA-MM-DD__PC.jsonl <- histórico append-only, 1 arquivo por PC por dia
-//     dados/logs/AAAA-MM-DD__PC.jsonl       <- log de gravações (apagado após 90 dias)
+//   <pasta do sistema>/
+//     SOLDA_PASTA_DO_SISTEMA.json    <- colocado À MÃO: {"sistema":"SOLDA_MMT"}.
+//                                       Pasta sem ele é recusada e NADA é criado.
+//     dados/banco/indice.json        <- índice: TOKEN de versão de cada domínio (~1KB).
+//     dados/banco/estoque_tubos.json <- estoque FIFO, tubos em uso, sequência FIFO
+//     dados/banco/solicitacoes.json  <- pedidos das líderes (com os tubos reservados)
+//     dados/banco/usuarios.json      <- usuários, modelos, linhas, identidade do banco
+//     dados/banco/config.json        <- correções, limpezas, plano do WH e demais campos
+//     dados/banco/bak/*.bak          <- cópia anterior de cada domínio (máx. 1 a cada 5 min)
+//     dados/banco/.lock              <- trava de gravação {id, pc, ts}
+//     dados/movimentos/AAAA-MM-DD__PCID.jsonl  <- histórico APPEND-ONLY, 1 arquivo por PC por dia
+//     dados/logs/AAAA-MM-DD__PCID.jsonl        <- log de gravações (apagado após 90 dias)
 //
-// REGRAS
-//   • Só o arquivo que mudou é regravado.
-//   • Gravação só com a trava. Já travado, relê o índice: se o token de algum
-//     arquivo mudou, outro PC gravou -> relê esse arquivo, refaz o merge
-//     (incluindo _resolverReservas) e só então grava. Nada é sobrescrito.
-//   • Cada PC só escreve no SEU arquivo de movimentos: o histórico nunca é disputado.
-//     No arquivo vale a última linha de cada id (carimbo _s). Exclusão = linha {_del}.
-//   • Toda gravação é conferida pelo tamanho (detecta arquivo truncado na rede).
+// GRAVAÇÃO (DB.push): LER -> JUNTAR -> CONFERIR -> GRAVAR, até 5 tentativas
+//   1. lerMudancas(): lê só o índice; relê os domínios com token diferente e a
+//      cauda dos arquivos de movimentos de outros PCs que cresceram.
+//   2. mergeDoDisco(): merge de 3 vias POR REGISTRO (B=base que este PC conhecia,
+//      L=memória deste PC, R=disco). Conflito = os dois mexeram no mesmo registro.
+//      O recurso disputado é o TUBO: dois IDs de solicitação diferentes com o
+//      mesmo tubo também é conflito. Quem gravou primeiro ganha (regra F).
+//   3. serializa; domínio igual ao que já está no disco não é gravado (zero I/O).
+//   4. pegarTrava()   5. relê o índice: token mudou? solta e volta ao passo 1.
+//   6. grava domínios (confere tamanho)  7. append em movimentos/logs
+//   8. índice POR ÚLTIMO  9. soltarTrava() (sempre, num finally)
 // ══════════════════════════════════════════════════════════════════════
 const PASTA={
-  ESQUEMA:1, CONFIRMACAO:'SOLDA_PASTA_DO_SISTEMA.json', INDICE:'indice.json', LOCK:'.lock',
-  LOCK_VALIDADE:8000, LOCK_ESPERA:6000, TENTATIVAS:5,
+  ESQUEMA:2, CONFIRMACAO:'SOLDA_PASTA_DO_SISTEMA.json', SISTEMAS_OK:['SOLDA_MMT','TPV_SolderControl'],
+  INDICE:'indice.json', LOCK:'.lock', LOCK_VALIDADE:8000, LOCK_ESPERA:6000, TENTATIVAS:5,
   HIST_DIAS:120,     // dias de movimentos carregados na tela (os arquivos NÃO são apagados)
   LOGS_DIAS:90,      // logs mais velhos que isso são apagados
   DOMINIOS:['estoque','solicitacoes','usuarios','config'],
+  ARQ:{estoque:'estoque_tubos.json',solicitacoes:'solicitacoes.json',usuarios:'usuarios.json',config:'config.json'},
   CAMPOS:{estoque:['estoque','emUso','fifoSeq','cTubo'],solicitacoes:['solicitacoes'],
           usuarios:['usuarios','modelos','linhas','_v','_sistema','_registro']},
   raiz:null,dados:null,banco:null,mov:null,logs:null,
-  indice:null,indiceTxt:'',bruto:{},ultBak:{},seqTk:0,
-  hist:new Map(),      // id -> {s, rec|null}   (tudo que veio dos arquivos de movimentos)
-  escrito:new Map(),   // id -> assinatura já gravada (ou '__DEL__')
-  lido:{},             // arquivo de movimentos -> bytes já consumidos
+  indice:null,      // _indice: o índice como este PC leu/gravou por último
+  bruto:{},         // _bruto[dom]: texto do domínio como este PC leu/gravou por último
+  ultBak:{},seqTk:0,
+  hist:new Map(),   // id -> {s, rec|null}   (tudo que veio dos arquivos de movimentos)
+  escrito:new Map(),// id -> assinatura já gravada (ou '__DEL__'). Linha de outro PC = "já gravado".
+  lido:{},          // arquivo de movimentos -> bytes já consumidos
   logPend:[],
 
   pcId(){
-    let id=null;try{id=localStorage.getItem('tpv_solda_pc_id');}catch(e){}
+    let id=null;
+    try{const m=/[#&]pc=([A-Z0-9_-]{2,20})/i.exec(location.hash||'');if(m)return m[1].toUpperCase();}catch(e){}   // só para teste com 2 abas
+    try{id=localStorage.getItem('tpv_solda_pc_id');}catch(e){}
     if(!id){id='PC-'+Math.random().toString(36).slice(2,8).toUpperCase();try{localStorage.setItem('tpv_solda_pc_id',id);}catch(e){}}
     return id;
   },
@@ -1608,7 +1633,7 @@ const PASTA={
   // ---------- arquivos ----------
   async ler(dir,nome){
     try{return await (await (await dir.getFileHandle(nome)).getFile()).text();}
-    catch(e){if(e.name==='NotFoundError'||e.name==='TypeError')return null;throw e;}
+    catch(e){if(e.name==='NotFoundError')return null;throw e;}
   },
   async gravar(dir,nome,txt,bak,semVerificar){
     if(bak&&Date.now()-(PASTA.ultBak[nome]||0)>5*60*1000){
@@ -1631,7 +1656,7 @@ const PASTA={
     return fim;
   },
 
-  // ---------- trava (escreve e confere) ----------
+  // ---------- (B) trava: escreve e confere ----------
   async pegarTrava(){
     const meu=PASTA.pcId()+'-'+Date.now().toString(36)+'-'+Math.random().toString(36).slice(2,8),ini=Date.now();
     while(Date.now()-ini<PASTA.LOCK_ESPERA){
@@ -1639,9 +1664,9 @@ const PASTA={
       if(atual){let o=null;try{o=JSON.parse(atual);}catch(e){}
         if(o&&o.id!==meu&&Date.now()-(o.ts||0)<PASTA.LOCK_VALIDADE){await sleep(40+Math.random()*90);continue;}}
       await PASTA.gravar(PASTA.banco,PASTA.LOCK,JSON.stringify({id:meu,pc:PASTA.pcId(),ts:Date.now()}),false,true);
-      // confere DUAS vezes: na rede, a gravação de outro PC pode chegar depois da 1ª conferência
       await sleep(25+Math.random()*45);
       let minha=false;try{minha=JSON.parse(await PASTA.ler(PASTA.banco,PASTA.LOCK)).id===meu;}catch(e){}
+      // confere uma 2ª vez: na rede, a gravação de outro PC pode chegar depois da 1ª conferência
       if(minha){await sleep(60+Math.random()*80);try{if(JSON.parse(await PASTA.ler(PASTA.banco,PASTA.LOCK)).id===meu)return meu;}catch(e){}}
       await sleep(40+Math.random()*120);
     }
@@ -1662,7 +1687,7 @@ const PASTA={
     const d={};PASTA.DOMINIOS.forEach(dom=>{if(partes[dom])Object.assign(d,JSON.parse(partes[dom]));});
     d.historico=PASTA.historicoAtual();return d;
   },
-  historicoAtual(){const a=[];PASTA.hist.forEach(v=>{if(v.rec)a.push(v.rec);});return a.sort((x,y)=>(x.ts||0)-(y.ts||0));},
+  historicoAtual(){const a=[];PASTA.hist.forEach(v=>{if(v.rec)a.push(JSON.parse(JSON.stringify(v.rec)));});return a.sort((x,y)=>(x.ts||0)-(y.ts||0));},
   assinatura(r){const {_s,_w,...resto}=r;return JSON.stringify(resto);},
 
   // aplica linhas de um arquivo de movimentos (vale a mais nova de cada id)
@@ -1685,18 +1710,21 @@ const PASTA={
   },
   shardsVisiveis(idx){const c=PASTA.diaCorte(PASTA.HIST_DIAS);return Object.keys((idx&&idx.movimentos)||{}).filter(n=>n.slice(0,10)>=c).sort();},
 
-  // ---------- abrir a pasta ----------
-  async ehPastaDoSistema(dh){
-    try{const o=JSON.parse(await PASTA.ler(dh,PASTA.CONFIRMACAO));return o&&o.sistema===ASSINATURA_BANCO?o:null;}catch(e){return null;}
+  // ---------- (A) abrir a pasta ----------
+  async confirmacao(dh){
+    let txt=null;try{txt=await PASTA.ler(dh,PASTA.CONFIRMACAO);}catch(e){return null;}
+    if(!txt)return null;
+    try{const o=JSON.parse(txt);return o&&PASTA.SISTEMAS_OK.includes(o.sistema)?o:null;}catch(e){return null;}
   },
-  async abrirHandles(dh,criar){
+  async abrirHandles(dh){
     PASTA.raiz=dh;
-    PASTA.dados=await dh.getDirectoryHandle('dados',{create:!!criar});
-    PASTA.banco=await PASTA.dados.getDirectoryHandle('banco',{create:!!criar});
+    PASTA.dados=await dh.getDirectoryHandle('dados',{create:true});
+    PASTA.banco=await PASTA.dados.getDirectoryHandle('banco',{create:true});
     PASTA.mov=await PASTA.dados.getDirectoryHandle('movimentos',{create:true});
     PASTA.logs=await PASTA.dados.getDirectoryHandle('logs',{create:true});
   },
-  zerar(){PASTA.raiz=PASTA.dados=PASTA.banco=PASTA.mov=PASTA.logs=null;PASTA.indice=null;PASTA.indiceTxt='';PASTA.bruto={};PASTA.hist=new Map();PASTA.escrito=new Map();PASTA.lido={};PASTA.logPend=[];},
+  zerar(){PASTA.raiz=PASTA.dados=PASTA.banco=PASTA.mov=PASTA.logs=null;PASTA.indice=null;PASTA.bruto={};PASTA.hist=new Map();PASTA.escrito=new Map();PASTA.lido={};PASTA.logPend=[];},
+  async temBanco(){return !!(await PASTA.ler(PASTA.banco,PASTA.INDICE));},
   // Lê o banco inteiro (só na conexão)
   async carregar(){
     const txt=await PASTA.ler(PASTA.banco,PASTA.INDICE);
@@ -1704,114 +1732,113 @@ const PASTA={
     const idx=JSON.parse(txt);
     if((idx.schema||0)>PASTA.ESQUEMA)throw new Error('o banco foi gravado por uma versão mais nova do sistema. Atualize o HTML.');
     const partes={};
-    for(const dom of PASTA.DOMINIOS){const t=await PASTA.ler(PASTA.banco,dom+'.json');partes[dom]=t||'{}';}
+    for(const dom of PASTA.DOMINIOS){const t=await PASTA.ler(PASTA.banco,PASTA.ARQ[dom]);partes[dom]=t||'{}';JSON.parse(partes[dom]);}
     PASTA.hist=new Map();PASTA.escrito=new Map();PASTA.lido={};
     for(const nome of PASTA.shardsVisiveis(idx)){try{await PASTA.lerShard(nome,0);}catch(e){console.warn('[movimentos]',nome,e);}}
-    PASTA.indice=idx;PASTA.indiceTxt=txt;PASTA.bruto=partes;
+    PASTA.indice=idx;PASTA.bruto=partes;
     return PASTA.juntar(partes);
   },
-  // Cria a estrutura nova a partir de um banco (JSON antigo ou banco novo)
-  async criar(dh,d,txtAntigo,nomeAntigo){
-    await PASTA.abrirHandles(dh,true);
-    if(await PASTA.ler(PASTA.banco,PASTA.INDICE))throw new Error('já existe um banco nesta pasta (dados/banco/indice.json)');
-    if(txtAntigo){const bd=await PASTA.banco.getDirectoryHandle('bak',{create:true});
-      await PASTA.gravar(bd,'JSON_ANTIGO_'+PASTA.hoje()+'__'+String(nomeAntigo||'banco').replace(/[^\w.-]/g,'_')+'.bak',txtAntigo,false);}
+  // Cria dados/ a partir de um banco (JSON antigo migrado ou banco novo vazio)
+  async criar(d,origem){
+    if(await PASTA.temBanco())throw new Error('já existe um banco nesta pasta (dados/banco/indice.json)');
     const idx={schema:PASTA.ESQUEMA,ts:Date.now(),arquivos:{},movimentos:{},logs:{},
-      migradoDe:nomeAntigo||null,migradoEm:new Date().toLocaleString('pt-BR'),migradoPor:PASTA.pcId()};
+      origem:origem||'banco novo',criadoEm:new Date().toLocaleString('pt-BR'),criadoPor:PASTA.pcId()};
     const partes=PASTA.fatiar(d);
-    for(const dom of PASTA.DOMINIOS){await PASTA.gravar(PASTA.banco,dom+'.json',partes[dom],false);idx.arquivos[dom]={tk:PASTA.novoToken(),t:Date.now()};}
+    for(const dom of PASTA.DOMINIOS){await PASTA.gravar(PASTA.banco,PASTA.ARQ[dom],partes[dom],false);idx.arquivos[dom]={tk:PASTA.novoToken(),t:Date.now()};}
     const ag=Date.now(),hist=d.historico||[];
     if(hist.length){
-      const nome=PASTA.hoje()+'__'+PASTA.pcId()+'.jsonl';
+      const nome=PASTA.shardHoje();
       const txt=hist.map(h=>JSON.stringify(Object.assign({},h,{_s:ag,_w:PASTA.pcId()}))).join('\n')+'\n';
       idx.movimentos[nome]=await PASTA.anexar(PASTA.mov,nome,txt);
     }
+    // índice POR ÚLTIMO: se a conversão cair no meio, não existe banco pela metade
     await PASTA.gravar(PASTA.banco,PASTA.INDICE,JSON.stringify(idx,null,1),false);
-    await PASTA.gravar(dh,PASTA.CONFIRMACAO,JSON.stringify({sistema:ASSINATURA_BANCO,id:d._registro&&d._registro.id,
-      criadoEm:new Date().toLocaleString('pt-BR'),aviso:'Não apague. Identifica esta pasta como a do Sistema de Solda.'},null,1),false);
     return hist.length;
   },
 
-  // ---------- sync: lê só o índice e o que mudou ----------
-  // Devolve null (nada mudou) ou {partes, histMudou}
+  // ---------- (C) lerMudancas: lê só o índice e o que mudou ----------
+  // Devolve null (nada mudou) ou {mudou:{dom:txt}, histMudou}. Erro de rede = exceção.
   async lerMudancas(){
     const txt=await PASTA.ler(PASTA.banco,PASTA.INDICE);
-    if(!txt||txt===PASTA.indiceTxt)return null;
+    if(!txt)throw new Error('índice do banco não encontrado');
     let idx;try{idx=JSON.parse(txt);}catch(e){return null;}   // índice sendo escrito: próximo ciclo
     const mudou={};
     for(const dom of PASTA.DOMINIOS){
       if(PASTA.tokenDe(idx,dom)===PASTA.tokenDe(PASTA.indice,dom))continue;
-      const t=await PASTA.ler(PASTA.banco,dom+'.json');
+      const t=await PASTA.ler(PASTA.banco,PASTA.ARQ[dom]);
       if(t==null)continue;try{JSON.parse(t);}catch(e){return null;}  // arquivo pela metade: tenta de novo
       mudou[dom]=t;
     }
     let histMudou=false;
     for(const nome of PASTA.shardsVisiveis(idx)){
       if((PASTA.lido[nome]||0)>=idx.movimentos[nome])continue;
-      try{if(await PASTA.lerShard(nome,PASTA.lido[nome]||0))histMudou=true;}catch(e){}
+      try{if(await PASTA.lerShard(nome,PASTA.lido[nome]||0))histMudou=true;}catch(e){if(e.name!=='NotFoundError')throw e;}
     }
-    // só dá o índice como lido se todos os movimentos dele chegaram (SMB pode atrasar)
-    const completo=PASTA.shardsVisiveis(idx).every(n=>(PASTA.lido[n]||0)>=idx.movimentos[n]);
-    PASTA.indice=idx;PASTA.indiceTxt=completo?txt:'';
+    PASTA.indice=idx;
     Object.assign(PASTA.bruto,mudou);
     return (Object.keys(mudou).length||histMudou)?{mudou,histMudou}:null;
   },
 
-  // ---------- gravação ----------
   log(acao){PASTA.logPend.push({ts:Date.now(),data:new Date().toLocaleString('pt-BR'),pc:PASTA.pcId(),login:cu?cu.login:'',nome:cu?cu.nome:'',acao});},
 
-  // Grava o db. Chamado com a trava JÁ obtida e o merge JÁ feito.
-  async gravarTudo(d){
-    const idx=JSON.parse(JSON.stringify(PASTA.indice||{schema:PASTA.ESQUEMA,arquivos:{},movimentos:{},logs:{}}));
-    idx.arquivos=idx.arquivos||{};idx.movimentos=idx.movimentos||{};idx.logs=idx.logs||{};
-    const partes=PASTA.fatiar(d),escritos=[],antes=Object.assign({},PASTA.bruto);
-    for(const dom of PASTA.DOMINIOS){
-      if(partes[dom]===PASTA.bruto[dom])continue;               // não mudou: zero bytes na rede
-      await PASTA.gravar(PASTA.banco,dom+'.json',partes[dom],true);
-      PASTA.bruto[dom]=partes[dom];idx.arquivos[dom]={tk:PASTA.novoToken(),t:Date.now()};escritos.push(dom);
-    }
+  // ---------- (D) passos 3 a 9 ----------
+  // Lança erro com .conflito=true quando outro PC gravou entre a leitura e a trava.
+  async gravar_(d){
+    const partes=PASTA.fatiar(d);
+    const paraGravar=PASTA.DOMINIOS.filter(dom=>partes[dom]!==PASTA.bruto[dom]);
     // histórico: só linhas novas/alteradas e exclusões, no arquivo DESTE PC
     const ag=Date.now(),linhas=[],vivos=new Set(),marcar=[];
     (d.historico||[]).forEach(h=>{if(!h||!h.id)return;const id=String(h.id);vivos.add(id);
       const a=PASTA.assinatura(h);if(PASTA.escrito.get(id)===a)return;
       linhas.push(JSON.stringify(Object.assign({},h,{_s:ag,_w:PASTA.pcId()})));marcar.push([id,a,h]);});
     PASTA.escrito.forEach((a,id)=>{if(a!=='__DEL__'&&!vivos.has(id)){linhas.push(JSON.stringify({id,_del:1,_s:ag,_w:PASTA.pcId()}));marcar.push([id,'__DEL__',null]);}});
-    if(linhas.length){
-      const nome=PASTA.shardHoje();
-      const fim=await PASTA.anexar(PASTA.mov,nome,linhas.join('\n')+'\n');
-      idx.movimentos[nome]=fim;PASTA.lido[nome]=fim;
-      marcar.forEach(([id,a,h])=>{PASTA.escrito.set(id,a);PASTA.hist.set(id,{s:ag,rec:h?JSON.parse(JSON.stringify(h)):null});});
-      escritos.push('movimentos('+linhas.length+')');
-    }
-    if(!escritos.length)return escritos;
-    // os arquivos de movimentos DESTE PC sempre entram no índice (se outro PC
-    // regravou o índice por cima, eles voltam aqui)
-    const meu='__'+PASTA.pcId()+'.';
-    Object.keys(PASTA.lido).forEach(n=>{if(n.includes(meu)&&(idx.movimentos[n]||0)<PASTA.lido[n])idx.movimentos[n]=PASTA.lido[n];});
-    PASTA.log(escritos.join(', '));
-    const lg=PASTA.logPend.splice(0);
-    try{const nome=PASTA.shardHoje();idx.logs[nome]=await PASTA.anexar(PASTA.logs,nome,lg.map(x=>JSON.stringify(x)).join('\n')+'\n');}
-    catch(e){console.warn('[logs]',e);}
-    const corteLog=PASTA.diaCorte(PASTA.LOGS_DIAS);Object.keys(idx.logs).forEach(n=>{if(n.slice(0,10)<corteLog)delete idx.logs[n];});
-    idx.schema=PASTA.ESQUEMA;idx.ts=Date.now();
-    const txt=JSON.stringify(idx,null,1);
-    await PASTA.gravar(PASTA.banco,PASTA.INDICE,txt,false);   // índice SEMPRE por último
-    // CONFERÊNCIA FINAL: espera um instante e relê tudo que gravou. Se outro PC
-    // gravou por cima (duas máquinas acharam que tinham a trava), desfaz a
-    // marcação local e devolve erro: o push relê, refaz o merge e grava de novo.
-    await sleep(120+Math.random()*120);
-    const conferir=[[PASTA.INDICE,txt]].concat(escritos.filter(e=>PASTA.DOMINIOS.includes(e)).map(dom=>[dom+'.json',partes[dom]]));
-    for(const [nome,esperado] of conferir){
-      if(await PASTA.ler(PASTA.banco,nome)!==esperado){
-        escritos.filter(e=>PASTA.DOMINIOS.includes(e)).forEach(dom=>{PASTA.bruto[dom]=antes[dom];});
-        PASTA.indiceTxt='';
-        const e=new Error('outro PC gravou ao mesmo tempo ('+nome+')');e.conflito=true;throw e;
+    if(!paraGravar.length&&!linhas.length)return [];                  // nada mudou: nem pega a trava
+
+    const trava=await PASTA.pegarTrava();                              // 4
+    if(!trava){const e=new Error('a pasta está ocupada por outro PC há mais de '+PASTA.LOCK_ESPERA/1000+'s');e.conflito=true;throw e;}
+    try{
+      // 5. JÁ COM A TRAVA: alguém gravou entre a nossa leitura e agora?
+      const idxTxt=await PASTA.ler(PASTA.banco,PASTA.INDICE);
+      let disco=null;try{disco=JSON.parse(idxTxt);}catch(e){}
+      if(!disco){const e=new Error('índice ilegível (sendo gravado)');e.conflito=true;throw e;}
+      const brigando=paraGravar.filter(dom=>PASTA.tokenDe(disco,dom)!==PASTA.tokenDe(PASTA.indice,dom));
+      if(brigando.length){const e=new Error('outro PC gravou '+brigando.join(', ')+' enquanto salvávamos');e.conflito=true;throw e;}
+      const idx=JSON.parse(JSON.stringify(disco));
+      idx.arquivos=idx.arquivos||{};idx.movimentos=idx.movimentos||{};idx.logs=idx.logs||{};
+      const escritos=[];
+      for(const dom of paraGravar){                                    // 6
+        await PASTA.gravar(PASTA.banco,PASTA.ARQ[dom],partes[dom],true);
+        idx.arquivos[dom]={tk:PASTA.novoToken(),t:Date.now()};escritos.push(dom);
       }
-    }
-    PASTA.indice=idx;PASTA.indiceTxt=txt;
-    return escritos;
+      if(linhas.length){                                               // 7
+        const nome=PASTA.shardHoje();
+        const fim=await PASTA.anexar(PASTA.mov,nome,linhas.join('\n')+'\n');
+        PASTA.lido[nome]=fim;
+        marcar.forEach(([id,a,h])=>{PASTA.escrito.set(id,a);PASTA.hist.set(id,{s:ag,rec:h?JSON.parse(JSON.stringify(h)):null});});
+        escritos.push('movimentos('+linhas.length+')');
+      }
+      // os arquivos de movimentos DESTE PC sempre entram no índice
+      const meu='__'+PASTA.pcId()+'.';
+      Object.keys(PASTA.lido).forEach(n=>{if(n.includes(meu)&&(idx.movimentos[n]||0)<PASTA.lido[n])idx.movimentos[n]=PASTA.lido[n];});
+      PASTA.log(escritos.join(', '));
+      const lg=PASTA.logPend.splice(0);
+      try{const nome=PASTA.shardHoje();idx.logs[nome]=await PASTA.anexar(PASTA.logs,nome,lg.map(x=>JSON.stringify(x)).join('\n')+'\n');}
+      catch(e){console.warn('[logs]',e);}
+      const corteLog=PASTA.diaCorte(PASTA.LOGS_DIAS);Object.keys(idx.logs).forEach(n=>{if(n.slice(0,10)<corteLog)delete idx.logs[n];});
+      idx.schema=PASTA.ESQUEMA;idx.ts=Date.now();
+      const txt=JSON.stringify(idx,null,1);
+      await PASTA.gravar(PASTA.banco,PASTA.INDICE,txt,false);         // 8. índice POR ÚLTIMO
+      // conferência final: relê o que gravou. Se dois PCs acharam que tinham a
+      // trava ao mesmo tempo, quem foi sobrescrito percebe aqui e refaz.
+      await sleep(120+Math.random()*120);
+      for(const [nome,esp] of [[PASTA.INDICE,txt]].concat(paraGravar.map(dom=>[PASTA.ARQ[dom],partes[dom]]))){
+        if(await PASTA.ler(PASTA.banco,nome)!==esp){const e=new Error('outro PC gravou ao mesmo tempo ('+nome+')');e.conflito=true;throw e;}
+      }
+      paraGravar.forEach(dom=>{PASTA.bruto[dom]=partes[dom];});
+      PASTA.indice=idx;
+      return escritos;
+    }finally{await PASTA.soltarTrava(trava);}                         // 9. SEMPRE
   },
-  // apaga logs com mais de 90 dias (1x por sessão, silencioso)
   async limparLogsVelhos(){
     try{const c=PASTA.diaCorte(PASTA.LOGS_DIAS),apagar=[];
       for await(const [n,h] of PASTA.logs.entries())if(h.kind==='file'&&/^\d{4}-\d{2}-\d{2}__/.test(n)&&n.slice(0,10)<c)apagar.push(n);
@@ -1820,121 +1847,111 @@ const PASTA={
   }
 };
 
-// ── Motor de sincronização (v13.0: em cima da PASTA) ──
-const DB={
-  base:null,lastMod:0,writing:false,pending:false,pulling:false,lastWriteAt:0,errCount:0,ciclo:0,
-  clone(o){return JSON.parse(JSON.stringify(o));},
-  adotar(dados){db=normalizarDB(dados);DB.base=DB.clone(db);DB.lastMod=(PASTA.indice&&PASTA.indice.ts)||Date.now();},
-  async push(){
-    if(!db)return;
-    if(!dbHandle||!PASTA.banco){setSync('SEM BANCO — não salvo');toast('⛔ Sem conexão com a pasta do banco na rede. O registro NÃO foi salvo.','err');return;}
-    if(DB.writing){DB.pending=true;return;}
-    DB.writing=true;setSync('Salvando…');
-    let houveMerge=false,trava=null;
-    try{
-      const gap=Date.now()-DB.lastWriteAt;if(gap<25)await sleep(25-gap);
-      trava=await PASTA.pegarTrava();
-      if(!trava)throw new Error('a pasta está ocupada por outro PC há mais de '+PASTA.LOCK_ESPERA/1000+'s');
-      // JÁ COM A TRAVA: alguém gravou depois da nossa última leitura?
-      for(let t=0;t<PASTA.TENTATIVAS;t++){
-        const m=await PASTA.lerMudancas();
-        if(!m)break;
-        // monta "o disco" = o que conhecíamos + o que mudou, e faz o merge de 3 vias
-        const disco=DB.clone(DB.base);
-        Object.keys(m.mudou).forEach(dom=>Object.assign(disco,JSON.parse(m.mudou[dom])));
-        disco.historico=PASTA.historicoAtual();   // inclui exclusões feitas por outro PC
-        const dn=normalizarDB(disco);
-        db=mergeDB(DB.base,db,dn);_resolverReservas(DB.base,dn,db);
-        DB.base=DB.clone(normalizarDB(PASTA.juntar(PASTA.bruto)));
-        houveMerge=true;
-      }
-      if(houveMerge)PASTA.log('merge com gravação de outro PC');
-      await PASTA.gravarTudo(db);
-      DB.lastWriteAt=Date.now();DB.lastMod=PASTA.indice.ts||Date.now();
-      DB.base=DB.clone(db);DB.errCount=0;setSync('Sincronizado');_bancoAtualizarData();
-      if(houveMerge)refreshView();
-    }catch(e){
-      console.warn('[gravar]',e);
-      if(e.conflito){PASTA.log('conflito: '+e.message);DB.pending=true;setSync('Conflito — refazendo…');return;}
-      DB.errCount++;setSync('Erro ao salvar');
-      if(DB.errCount===3)toast('⚠️ O banco da rede não está aceitando a gravação ('+e.message+'). Avise o MMT antes de continuar.','err');
-      const d=Math.min(150*Math.pow(2,DB.errCount-1),4000);
-      DB.pending=true;setTimeout(()=>{if(DB.pending){DB.pending=false;DB.push();}},d);
-    }finally{
-      if(trava)await PASTA.soltarTrava(trava);
-      DB.writing=false;
-      // pending só é limpo quando a nova gravação COMEÇA. Antes era limpo aqui,
-      // e nesses 60ms o sync de 2s podia ler a rede por cima da alteração ainda
-      // não gravada e apagá-la (pedido sumia sem erro nenhum).
-      if(DB.pending)setTimeout(()=>{if(DB.pending&&!DB.writing){DB.pending=false;DB.push();}},60);
-    }
-  },
-  // Lê só o índice (~1KB). Se algum arquivo mudou, lê só ele.
-  async pull(forcar){
-    if(!dbHandle||!PASTA.banco||DB.writing||DB.pending||DB.pulling)return false;
-    if(!forcar&&document.hidden&&(DB.ciclo%15!==0)){DB.ciclo++;return false;}
-    DB.pulling=true;
-    try{
-      DB.ciclo++;
-      if(forcar||DB.ciclo%15===0)PASTA.indiceTxt='';   // de tempos em tempos confere tudo (SMB atrasa)
-      const m=await PASTA.lerMudancas();
-      if(!m)return false;
-      if(DB.writing||DB.pending)return false;          // a gravação fará o merge
-      DB.adotar(PASTA.juntar(PASTA.bruto));_bancoAtualizarData();
-      setSync('Atualizado');refreshView();return true;
-    }catch(e){setSync('Erro ao ler');return false;}finally{DB.pulling=false;}
-  },
-  async pullNow(){for(let i=0;i<40&&(DB.writing||DB.pending||DB.pulling);i++)await sleep(50);await DB.pull(true);}
-};
+// Erro que é rede/pasta inacessível (não é conflito, não é "não existe")
+function _ehErroDeRede(e){return !!e&&!e.conflito&&e.name!=='InvalidStateError'&&!/state had changed/i.test(e.message||'');}
+function _ehConflitoArquivo(e){return !!e&&(e.conflito||e.name==='InvalidStateError'||/state had changed/i.test(e.message||''));}
 
-// ── MERGE por delta: aplica no disco só o que ESTA máquina mudou desde a última leitura ──
-function mergeLista(base,local,disk,key){
+// ══════════════════════════════════════════════════════════════════════
+// (E) MERGE DE 3 VIAS POR REGISTRO
+//   B = base (o que este PC conhecia)  L = memória deste PC  R = disco agora
+//   só L mudou -> L · só R mudou -> R · nenhum -> R · os dois -> CONFLITO (R ganha)
+//   exceção: L e R iguais -> não é conflito
+// ══════════════════════════════════════════════════════════════════════
+const _sig=x=>x===undefined?'__NADA__':JSON.stringify(x);
+function merge3Lista(base,local,disk,key,conflitos,nome){
   base=base||[];local=local||[];disk=disk||[];
-  const bK=new Map(base.map(x=>[key(x),x])),lK=new Map(local.map(x=>[key(x),x]));
-  const removidos=new Set([...bK.keys()].filter(k=>!lK.has(k)));
-  const out=[],outK=new Set();
-  disk.forEach(x=>{const k=key(x);if(removidos.has(k)||outK.has(k))return;const l=lK.get(k),b=bK.get(k);if(l&&b&&JSON.stringify(l)!==JSON.stringify(b))x=l;out.push(x);outK.add(k);});
-  local.forEach((x,i)=>{const k=key(x);if(bK.has(k)||outK.has(k))return;if(i===0&&local.length>1)out.unshift(x);else out.push(x);outK.add(k);});
+  const bK=new Map(base.map(x=>[key(x),x])),lK=new Map(local.map(x=>[key(x),x])),rK=new Map(disk.map(x=>[key(x),x]));
+  const out=[],vistos=new Set();
+  const decidir=k=>{
+    const B=bK.get(k),L=lK.get(k),R=rK.get(k),sB=_sig(B),sL=_sig(L),sR=_sig(R);
+    if(sL===sB)return R;                 // só o disco mudou (ou ninguém)
+    if(sR===sB)return L;                 // só eu mudei
+    // os dois chegaram ao mesmo resultado: só não é conflito se o registro não
+    // existia antes (os dois criaram o mesmo). Se existia, os dois fizeram a mesma
+    // operação nele (ex.: dois PCs entregaram a mesma solicitação) -> conflito.
+    if(sL===sR&&B===undefined)return R;
+    if(conflitos)conflitos.push({tipo:nome,chave:k,B,L,R});
+    return R;                            // CONFLITO: quem gravou primeiro ganha
+  };
+  disk.forEach(x=>{const k=key(x);if(vistos.has(k))return;vistos.add(k);const v=decidir(k);if(v!==undefined)out.push(v);});
+  local.forEach(x=>{const k=key(x);if(vistos.has(k))return;vistos.add(k);const v=decidir(k);if(v!==undefined)out.push(v);});
   return out;
 }
-function mergeMapaListas(base,local,disk,key){
+function merge3MapaListas(base,local,disk,key,conflitos,nome){
   base=base||{};local=local||{};disk=disk||{};const out={};
-  new Set([...Object.keys(base),...Object.keys(local),...Object.keys(disk)]).forEach(k=>{const r=mergeLista(base[k],local[k],disk[k],key);if(r.length)out[k]=r;});
+  new Set([...Object.keys(disk),...Object.keys(local),...Object.keys(base)]).forEach(k=>{
+    const r=merge3Lista(base[k],local[k],disk[k],key,conflitos,nome);
+    if(r.length||disk[k]||(local[k]&&!base[k]))out[k]=r;});
   return out;
 }
-function mergeMapaValores(base,local,disk){
-  base=base||{};local=local||{};disk=disk||{};const out=Object.assign({},disk);
-  new Set([...Object.keys(base),...Object.keys(local)]).forEach(k=>{if(JSON.stringify(local[k])!==JSON.stringify(base[k])){if(local[k]===undefined)delete out[k];else out[k]=local[k];}});
+function merge3Valores(base,local,disk,conflitos,nome,resolver){
+  base=base||{};local=local||{};disk=disk||{};const out={};
+  new Set([...Object.keys(disk),...Object.keys(local),...Object.keys(base)]).forEach(k=>{
+    const B=base[k],L=local[k],R=disk[k],sB=_sig(B),sL=_sig(L),sR=_sig(R);let v;
+    if(sL===sB||sL===sR)v=R;else if(sR===sB)v=L;
+    else{v=resolver?resolver(L,R):R;if(conflitos&&!resolver)conflitos.push({tipo:nome,chave:k,B,L,R});}
+    if(v!==undefined)out[k]=v;});
   return out;
 }
+// Estado de cada TUBO (o recurso disputado): onde está e quem o reservou
+function _estadoTubos(d){
+  const m=new Map(),pega=l=>{if(!m.has(l))m.set(l,{est:'',res:[],uso:''});return m.get(l);};
+  Object.keys(d.estoque||{}).forEach(mod=>(d.estoque[mod]||[]).forEach(t=>{pega(t.lpn).est=mod;}));
+  Object.keys(d.emUso||{}).forEach(ln=>(d.emUso[ln]||[]).forEach(t=>{pega(t.lpn).uso=ln;}));
+  (d.solicitacoes||[]).forEach(s=>{if(s.status==='PENDENTE')(s.reservados||[]).forEach(t=>pega(t.lpn).res.push(s.id));});
+  m.forEach(v=>v.res.sort());
+  return m;
+}
+const _sigTubo=v=>v?v.est+'|'+v.res.join(',')+'|'+v.uso:'__NADA__';
+// Junta B, L e R. Devolve {d, conflitos, tubos}: conflitos de registro e de tubo.
 function mergeDB(base,local,disk){
   base=base||defDB();
+  const c=[];
   const r=DB.clone(disk);
-  r.historico=mergeLista(base.historico,local.historico,disk.historico,h=>h.id).sort((a,b)=>(a.ts||0)-(b.ts||0));
-  r.estoque=mergeMapaListas(base.estoque,local.estoque,disk.estoque,s=>s.lpn);
-  r.emUso=mergeMapaListas(base.emUso,local.emUso,disk.emUso,s=>s.lpn);
-  r.usuarios=mergeLista(base.usuarios,local.usuarios,disk.usuarios,u=>u.login);
-  r.modelos=mergeLista(base.modelos,local.modelos,disk.modelos,m=>m.prefixo);
-  r.linhas=mergeLista(base.linhas,local.linhas,disk.linhas,l=>l);
-  r.correcoes=mergeLista(base.correcoes,local.correcoes,disk.correcoes,c=>c.id);
-  r.limpezas=mergeLista(base.limpezas,local.limpezas,disk.limpezas,c=>c.id);
-  r.solicitacoes=mergeLista(base.solicitacoes,local.solicitacoes,disk.solicitacoes,c=>c.id).sort((a,b)=>(a.ts||0)-(b.ts||0));
-  // Plano do WH: vence sempre a importação mais recente (arquivo inteiro, não é lista incremental)
-  {const lp=local.planoWH||{},dp=disk.planoWH||{};r.planoWH=((lp.ts||0)>=(dp.ts||0))?lp:dp;}
-  r.cTubo=mergeMapaValores(base.cTubo,local.cTubo,disk.cTubo);
-  r.fifoSeq=mergeMapaValores(base.fifoSeq,local.fifoSeq,disk.fifoSeq);
-  if(local._sistema||disk._sistema)r._sistema=local._sistema||disk._sistema; // mantém assinatura do banco
-  if(local._registro||disk._registro)r._registro=disk._registro||local._registro; // mantém registro de identidade
-  return r;
+  r.historico=merge3Lista(base.historico,local.historico,disk.historico,h=>h.id,c,'histórico').sort((a,b)=>(a.ts||0)-(b.ts||0));
+  r.estoque=merge3MapaListas(base.estoque,local.estoque,disk.estoque,s=>s.lpn,c,'estoque');
+  r.emUso=merge3MapaListas(base.emUso,local.emUso,disk.emUso,s=>s.lpn,c,'em uso');
+  r.usuarios=merge3Lista(base.usuarios,local.usuarios,disk.usuarios,u=>u.login,c,'usuário');
+  r.modelos=merge3Lista(base.modelos,local.modelos,disk.modelos,m=>m.prefixo,c,'modelo');
+  r.linhas=merge3Lista(base.linhas,local.linhas,disk.linhas,l=>l,c,'linha');
+  r.correcoes=merge3Lista(base.correcoes,local.correcoes,disk.correcoes,x=>x.id,c,'correção');
+  r.limpezas=merge3Lista(base.limpezas,local.limpezas,disk.limpezas,x=>x.id,c,'limpeza');
+  r.solicitacoes=merge3Lista(base.solicitacoes,local.solicitacoes,disk.solicitacoes,x=>x.id,c,'solicitação').sort((a,b)=>(a.ts||0)-(b.ts||0));
+  {const lp=local.planoWH||{},dp=disk.planoWH||{},bp=base.planoWH||{};r.planoWH=(_sig(lp)!==_sig(bp)&&(lp.ts||0)>=(dp.ts||0))?lp:dp;}
+  r.cTubo=merge3Valores(base.cTubo,local.cTubo,disk.cTubo,c,'contador');
+  // sequência FIFO: os dois PCs avançaram -> fica o maior (nenhum número se repete)
+  r.fifoSeq=merge3Valores(base.fifoSeq,local.fifoSeq,disk.fifoSeq,c,'fifo',(L,R)=>Math.max(+L||0,+R||0));
+  if(local._sistema||disk._sistema)r._sistema=disk._sistema||local._sistema;
+  if(local._registro||disk._registro)r._registro=disk._registro||local._registro;
+  // CONFLITO NO TUBO: o mesmo tubo mexido aqui e no disco (ex.: dois IDs de solicitação diferentes)
+  const tB=_estadoTubos(base),tL=_estadoTubos(local),tR=_estadoTubos(disk),tubos=[];
+  new Set([...tL.keys(),...tR.keys()]).forEach(l=>{
+    const sB=_sigTubo(tB.get(l)),sL=_sigTubo(tL.get(l)),sR=_sigTubo(tR.get(l));
+    // os dois mexeram no mesmo tubo (mesmo que tenham chegado ao mesmo estado)
+    if(sL!==sB&&sR!==sB&&(sL!==sR||tB.has(l)))tubos.push(l);
+  });
+  return {d:r,conflitos:c,tubos};
 }
 
-// ── (v12.3) TRAVA DE RESERVA DUPLICADA ──
-// Duas líderes solicitando ao mesmo tempo (ou uma máquina com leitura velha da rede)
-// reservavam o MESMO tubo, e o merge juntava as duas solicitações. Agora, depois do
-// merge, toda solicitação NOVA desta máquina é conferida contra o que já está no disco:
-// quem gravou primeiro fica com o tubo; a segunda recebe o próximo tubo livre da fila
-// ou, se não houver, é cancelada automaticamente com aviso.
+// ══════════════════════════════════════════════════════════════════════
+// (F) CONFLITO DE TUBO: QUEM GRAVOU PRIMEIRO GANHA
+// Roda SEMPRE depois do merge, em cima do estado do disco. Toda solicitação
+// NOVA deste PC (ainda não está no disco) tem os tubos conferidos: tubo já
+// reservado/entregue/fora do estoque -> próximo tubo livre FIFO; se faltar,
+// reduz a quantidade; se não sobrar nenhum, cancela. Com aviso de quem pegou.
+// ══════════════════════════════════════════════════════════════════════
 let _avisosReserva=[];
+function _quemPegou(d,lpn){
+  let s=null;
+  (d.solicitacoes||[]).forEach(x=>{if(x.status==='CANCELADA')return;
+    const tem=(x.reservados||[]).some(t=>t.lpn===lpn)||(x.lpns||[]).includes(lpn);
+    if(tem&&(!s||(x.ts||0)>(s.ts||0)))s=x;});
+  if(s)return{nome:s.lider||'outra líder',hora:s.hora||''};
+  let h=null;(d.historico||[]).forEach(x=>{if(x.lpn===lpn&&(!h||(x.ts||0)>(h.ts||0)))h=x;});
+  if(h)return{nome:h.lider||h.entreguePor||'outro PC',hora:h.hora||''};
+  return{nome:'outro PC',hora:''};
+}
+const _nTubo=t=>'#'+(t.fifo!=null?t.fifo:'–')+' ('+t.lpn+')';
 function _resolverReservas(base,disk,r){
   const ant=new Set([...(base&&base.solicitacoes||[]),...(disk.solicitacoes||[])].map(x=>x.id));
   const novas=(r.solicitacoes||[]).filter(x=>!ant.has(x.id)&&x.status==='PENDENTE');
@@ -1947,30 +1964,253 @@ function _resolverReservas(base,disk,r){
   novas.sort((a,b)=>(a.ts||0)-(b.ts||0)).forEach(sol=>{
     const fila=(r.estoque&&r.estoque[sol.modelo])||[];
     const naFila=new Set(fila.map(t=>t.lpn));
-    const trocas=[];let falta=false;
+    const trocas=[],perdidos=[];
     sol.reservados=(sol.reservados||[]).map(t=>{
       if(!ocupados.has(t.lpn)&&naFila.has(t.lpn)){ocupados.add(t.lpn);return t;}
+      const quem=_quemPegou(disk,t.lpn);
       const livre=fila.find(it=>!ocupados.has(it.lpn));
-      if(!livre){falta=true;return null;}
+      if(!livre){perdidos.push({t,quem});return null;}
       ocupados.add(livre.lpn);const nt={lpn:livre.lpn,fifo:livre.fifo!=null?livre.fifo:null};
-      trocas.push([t.lpn,nt]);return nt;
+      trocas.push({de:t,para:nt,quem});return nt;
     }).filter(Boolean);
-    trocas.forEach(([velho,nt])=>(r.historico||[]).forEach(h=>{
-      if(h.solicitacaoId===sol.id&&h.tipo==='SOLICITACAO'&&h.lpn===velho){h.lpn=nt.lpn;h.fifo=nt.fifo;h.tubo=nt.fifo!=null?nt.fifo:'–';}}));
-    if(falta){
+    trocas.forEach(({de,para})=>(r.historico||[]).forEach(h=>{
+      if(h.solicitacaoId===sol.id&&h.tipo==='SOLICITACAO'&&h.lpn===de.lpn){h.lpn=para.lpn;h.fifo=para.fifo;h.tubo=para.fifo!=null?para.fifo:'–';}}));
+    if(perdidos.length){
       const fic=new Set(sol.reservados.map(t=>t.lpn));
       r.historico=(r.historico||[]).filter(h=>!(h.solicitacaoId===sol.id&&h.tipo==='SOLICITACAO'&&!fic.has(h.lpn)));
       sol.qty=sol.reservados.length;
-      if(!sol.qty){sol.status='CANCELADA';sol.motivo='Tubo já reservado por outra solicitação no mesmo instante';}
+      if(!sol.qty){sol.status='CANCELADA';sol.motivo='Sem tubo livre: os tubos já tinham sido reservados por outra solicitação';}
     }
-    if(trocas.length||falta)_avisosReserva.push({sol,trocas,falta});
+    if(trocas.length||perdidos.length){
+      const frases=trocas.map(x=>'O tubo '+_nTubo(x.de)+' já tinha sido reservado por '+x.quem.nome+(x.quem.hora?' às '+x.quem.hora:'')+'. Você ficou com o tubo '+_nTubo(x.para)+'.')
+        .concat(perdidos.map(x=>'O tubo '+_nTubo(x.t)+' já tinha sido reservado por '+x.quem.nome+(x.quem.hora?' às '+x.quem.hora:'')+' e não há outro tubo '+sol.modelo+' livre.'));
+      if(sol.status==='CANCELADA')frases.push('Solicitação CANCELADA: não há tubo '+sol.modelo+' livre. Fale com o MMT.');
+      else if(perdidos.length)frases.push('Quantidade reduzida para '+sol.qty+'.');
+      _avisosReserva.push({sol,trocas,falta:perdidos.length>0,texto:frases.join(' ')});
+    }
   });
 }
 function _mostrarAvisosReserva(){
-  _avisosReserva.splice(0).forEach(a=>{
-    if(a.sol.status==='CANCELADA')toast('⛔ Outra líder reservou o último tubo de '+a.sol.modelo+' no mesmo instante. Sua solicitação foi CANCELADA — fale com o MMT.','err');
-    else toast('⚠️ Tubo já reservado por outra líder no mesmo instante. Sua reserva foi trocada para: '+a.sol.reservados.map(t=>'#'+(t.fifo!=null?t.fifo:'–')).join(', ')+(a.falta?' (quantidade reduzida para '+a.sol.qty+')':''),'warn');
-  });
+  _avisosReserva.splice(0).forEach(a=>toast((a.sol.status==='CANCELADA'?'⛔ ':'⚠️ ')+a.texto,a.sol.status==='CANCELADA'?'err':'warn',15000));
+}
+function _textoConflito(c,d){
+  const x=c[0],o=x.R||x.L||{};
+  const qual=x.tipo==='solicitação'?'a solicitação de '+(o.lider||'')+' ('+(o.modelo||'')+(o.op?' · OP '+o.op:'')+')'
+    :(x.tipo==='estoque'||x.tipo==='em uso'||x.tipo==='tubo')?'o tubo '+x.chave
+    :x.tipo==='histórico'?'o registro do histórico '+(o.lpn||x.chave):'o registro "'+x.chave+'" ('+x.tipo+')';
+  const quem=x.tipo==='solicitação'&&x.R&&x.R.entreguePor?x.R.entreguePor:x.tipo==='tubo'||x.tipo==='estoque'||x.tipo==='em uso'?_quemPegou(d,x.chave).nome:'';
+  return 'Outro computador'+(quem?' ('+quem+')':'')+' já tinha alterado '+qual+' um instante antes. Sua operação NÃO foi gravada. Confira a tela atualizada e refaça.';
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// MOTOR DE SINCRONIZAÇÃO
+//   save()/DB.push() devolve {ok, offline, conflito, msg}. ok=false -> NADA foi gravado.
+//   Operação crítica: DB.pullNow() marca o início (guarda a memória ANTES da
+//   operação e trava o sync de fundo: _mutating). Se o save der conflito de
+//   registro, a operação é desfeita inteira e a memória fica igual ao disco.
+// ══════════════════════════════════════════════════════════════════════
+// conflitos que desfazem a operação (os demais: vale o disco, com aviso)
+const _CONFLITO_GRAVE=['solicitação','estoque','em uso','histórico','correção','limpeza'];
+const _LS_PEND=()=> 'tpv_solda_nao_enviadas_'+PASTA.pcId();
+const DB={
+  base:null,lastMod:0,writing:false,fila:null,pulling:false,lastWriteAt:0,errCount:0,ciclo:0,
+  offline:false,mutando:0,op:null,sujo:false,
+  naoEnviadas:{},   // id da solicitação feita SEM REDE -> quando foi feita
+  clone(o){return JSON.parse(JSON.stringify(o));},
+  adotar(dados){db=normalizarDB(dados);DB.base=DB.clone(db);DB.lastMod=(PASTA.indice&&PASTA.indice.ts)||Date.now();DB.sujo=false;},
+
+  // Marca o início de uma operação crítica (chamado pelo pullNow)
+  _iniciarOp(){
+    if(DB.op)DB._fimOp();
+    DB.mutando++;
+    const op={antes:DB.clone(db),t:Date.now()};
+    op.timer=setTimeout(()=>{if(DB.op===op)DB._fimOp();},3000);   // operação desistiu antes de gravar
+    DB.op=op;
+  },
+  _fimOp(){if(!DB.op)return;clearTimeout(DB.op.timer);DB.op=null;DB.mutando=Math.max(0,DB.mutando-1);},
+
+  // save(): grava e devolve o resultado. As chamadas se enfileiram (uma de cada vez).
+  push(opcoes){
+    const op=DB.op;if(op){clearTimeout(op.timer);DB.op=null;}
+    DB.sujo=true;
+    const anterior=DB.fila||Promise.resolve();
+    const p=anterior.catch(()=>{}).then(()=>DB._gravar(op,opcoes||{})).finally(()=>{if(op)DB.mutando=Math.max(0,DB.mutando-1);});
+    DB.fila=p.finally(()=>{if(DB.fila===q)DB.fila=null;});const q=DB.fila;
+    return p;
+  },
+
+  async _gravar(op,opcoes){
+    if(!db)return{ok:false,msg:'sem banco'};
+    if(!dbHandle||!PASTA.banco){setSync('SEM BANCO — não salvo');toast('⛔ Sem conexão com a pasta do banco na rede. O registro NÃO foi salvo.','err');return{ok:false,msg:'sem banco'};}
+    DB.writing=true;setSync('Salvando…');
+    let resultado={ok:true},houveMerge=false;
+    try{
+      const gap=Date.now()-DB.lastWriteAt;if(gap<25)await sleep(25-gap);
+      for(let t=1;;t++){
+        // 1. lerMudancas (read-before-write)
+        const m=await PASTA.lerMudancas();
+        DB._online();
+        // Pendência feita sem rede há mais de 10 min: a líder confirma antes de enviar
+        if(t===1)DB._confirmarPendenciasVelhas();
+        // 2. merge de 3 vias
+        if(m){
+          houveMerge=true;
+          const disco=DB.clone(DB.base);
+          Object.keys(m.mudou).forEach(dom=>Object.assign(disco,JSON.parse(m.mudou[dom])));
+          disco.historico=PASTA.historicoAtual();
+          const R=normalizarDB(disco);
+          const res=mergeDB(DB.base,db,R);
+          const tubosSemExplicacao=res.tubos.filter(l=>!_tuboDeSolicitacaoNova(l,DB.base,db,R));
+          const graves=res.conflitos.filter(x=>_CONFLITO_GRAVE.includes(x.tipo));
+          if(op&&(graves.length||tubosSemExplicacao.length)){
+            // CONFLITO DE REGISTRO: a operação inteira é desfeita; memória = disco
+            const lista=graves.length?graves:tubosSemExplicacao.map(l=>({tipo:'tubo',chave:l}));
+            resultado={ok:false,conflito:true,msg:_textoConflito(lista,R)};
+            db=mergeDB(DB.base,op.antes,R).d;      // o que este PC tinha ANTES da operação + o disco
+            PASTA.log('conflito: '+lista.map(x=>x.tipo+' '+x.chave).join(', '));
+          }else{
+            db=res.d;
+            if(res.conflitos.length){PASTA.log('conflito (disco ganhou): '+res.conflitos.map(x=>x.tipo+' '+x.chave).join(', '));
+              toast('⚠️ '+_textoConflito(res.conflitos,R).replace('Sua operação NÃO foi gravada. Confira a tela atualizada e refaça.','Ficou valendo a versão do outro computador.'),'warn',10000);}
+          }
+          _resolverReservas(DB.base,R,db);          // regra F sempre sobre o estado do disco
+          DB.base=R;                                // a base do próximo merge é o disco atual
+        }else{
+          _resolverReservas(DB.base,DB.base,db);
+        }
+        // 3-9
+        try{
+          const escritos=await PASTA.gravar_(db);
+          if(escritos.length){DB.lastWriteAt=Date.now();DB.lastMod=PASTA.indice.ts||Date.now();}
+          break;
+        }catch(e){
+          if(!_ehConflitoArquivo(e))throw e;
+          if(t>=PASTA.TENTATIVAS){const er=new Error('outro PC alterou o banco ao mesmo tempo, refaça a operação');er.conflito5=true;throw er;}
+          setSync('Outro PC gravou junto — refazendo…');
+          await sleep(60+Math.random()*140*t);
+        }
+      }
+      DB.base=DB.clone(db);DB.errCount=0;DB.sujo=false;
+      DB._limparPendencias();
+      resultado.avisos=_avisosReserva.splice(0);
+      resultado.avisos.forEach(a=>toast((a.sol.status==='CANCELADA'?'⛔ ':'⚠️ ')+a.texto,a.sol.status==='CANCELADA'?'err':'warn',15000));
+      setSync(resultado.ok?'Sincronizado':'Atualizado com o outro PC');_bancoAtualizarData();
+      if(!resultado.ok)toast('⛔ '+resultado.msg,'err',12000);
+      if(houveMerge||!resultado.ok)setTimeout(()=>refreshView(),0);
+      return resultado;
+    }catch(e){
+      console.warn('[gravar]',e);
+      if(e.conflito5){
+        // 5 colisões seguidas: NUNCA grava por cima. Operação desfeita.
+        if(op){db=DB.clone(op.antes);setTimeout(()=>refreshView(),0);}
+        setSync('Não salvo — rede disputada');toast('⛔ Não foi possível salvar: '+e.message+'.','err',10000);
+        return{ok:false,conflito:true,msg:e.message};
+      }
+      // falha de leitura/gravação da pasta = SEM REDE
+      DB._offline(e);
+      if(op&&!opcoes.aceitaOffline){
+        db=DB.clone(op.antes);setTimeout(()=>refreshView(),0);   // operação NÃO aconteceu
+        toast('⛔ SEM CONEXÃO com a pasta da rede — a operação NÃO foi feita.','err',8000);
+        return{ok:false,offline:true,msg:'sem conexão'};
+      }
+      DB.sujo=true;   // fica pendente: o sync tenta de novo quando a rede voltar
+      return{ok:false,offline:true,msg:'sem conexão'};
+    }finally{DB.writing=false;}
+  },
+
+  _online(){if(DB.offline){DB.offline=false;_bannerRede();}},
+  _offline(e){if(!DB.offline){DB.offline=true;_bannerRede();}setSync('SEM CONEXÃO');},
+
+  // solicitações feitas sem rede: ficam marcadas, guardadas neste PC e visíveis na tela
+  marcarNaoEnviada(solId){
+    DB.naoEnviadas[solId]=DB.naoEnviadas[solId]||Date.now();DB._salvarPendencias();_bannerRede();
+  },
+  _salvarPendencias(){
+    try{const ids=Object.keys(DB.naoEnviadas);
+      if(!ids.length){localStorage.removeItem(_LS_PEND());return;}
+      const lista=ids.map(id=>({em:DB.naoEnviadas[id],sol:(db.solicitacoes||[]).find(s=>s.id===id),hist:(db.historico||[]).filter(h=>h.solicitacaoId===id&&h.tipo==='SOLICITACAO')})).filter(x=>x.sol);
+      localStorage.setItem(_LS_PEND(),JSON.stringify(lista));
+    }catch(e){}
+  },
+  _limparPendencias(){
+    let mudou=false;
+    Object.keys(DB.naoEnviadas).forEach(id=>{mudou=true;delete DB.naoEnviadas[id];});
+    if(mudou){DB._salvarPendencias();_bannerRede();}
+  },
+  // ao abrir o sistema: devolve para a memória o que foi pedido sem rede antes de fechar
+  restaurarPendencias(){
+    let lista=[];try{lista=JSON.parse(localStorage.getItem(_LS_PEND())||'[]');}catch(e){}
+    let n=0;
+    lista.forEach(x=>{if(!x||!x.sol||db.solicitacoes.some(s=>s.id===x.sol.id))return;
+      db.solicitacoes.push(x.sol);(x.hist||[]).forEach(h=>{if(!db.historico.some(y=>y.id===h.id))db.historico.push(h);});
+      DB.naoEnviadas[x.sol.id]=x.em||Date.now();n++;});
+    if(!n){try{localStorage.removeItem(_LS_PEND());}catch(e){}return 0;}
+    DB.sujo=true;_bannerRede();return n;
+  },
+  _confirmarPendenciasVelhas(){
+    const ids=Object.keys(DB.naoEnviadas);if(!ids.length)return;
+    const velho=Math.min(...ids.map(id=>DB.naoEnviadas[id]));
+    if(Date.now()-velho<10*60*1000)return;
+    const sols=(db.solicitacoes||[]).filter(s=>DB.naoEnviadas[s.id]);
+    const min=Math.round((Date.now()-velho)/60000);
+    const txt=sols.map(s=>'• '+s.modelo+' · OP '+s.op+' · '+s.linha+' · '+s.qty+' tubo(s) — pedido às '+s.hora).join('\n');
+    const ok=confirm('A REDE VOLTOU.\n\nVocê fez '+sols.length+' solicitação(ões) SEM CONEXÃO há '+min+' min:\n'+txt+
+      '\n\nO estoque mudou enquanto você estava sem rede. O sistema vai conferir no estoque ATUALIZADO: tubo que outra pessoa já pegou é trocado pelo próximo livre (ou a quantidade é reduzida) e você recebe o aviso.\n\nOK = enviar agora   ·   Cancelar = descartar esses pedidos');
+    if(ok){ids.forEach(id=>{DB.naoEnviadas[id]=Date.now();});return;}
+    const fora=new Set(ids);
+    db.solicitacoes=db.solicitacoes.filter(s=>!fora.has(s.id));
+    db.historico=db.historico.filter(h=>!fora.has(h.solicitacaoId)||PASTA.escrito.has(String(h.id)));
+    DB.naoEnviadas={};DB._salvarPendencias();_bannerRede();
+    toast('Pedidos feitos sem rede foram descartados.','warn');
+  },
+
+  // Sync de fundo: lê só o índice (~1KB). Não roda durante uma operação (_mutating).
+  async pull(forcar){
+    if(!dbHandle||!PASTA.banco||DB.writing||DB.fila||DB.pulling)return false;
+    if(DB.mutando>0&&!forcar)return false;
+    if(!forcar&&document.hidden&&(DB.ciclo%15!==0)){DB.ciclo++;return false;}
+    if(DB.sujo){if(!DB.offline||DB.ciclo%5===0){DB.ciclo++;DB.push();}else DB.ciclo++;return false;}   // tem coisa a gravar: a gravação faz o merge
+    DB.pulling=true;
+    try{
+      DB.ciclo++;
+      const m=await PASTA.lerMudancas();
+      DB._online();
+      if(!m)return false;
+      if(DB.writing||DB.fila||DB.sujo)return false;
+      DB.adotar(PASTA.juntar(PASTA.bruto));_bancoAtualizarData();
+      setSync('Atualizado');refreshView();return true;
+    }catch(e){DB._offline(e);return false;}finally{DB.pulling=false;}
+  },
+  // Antes de uma operação crítica: espera a gravação em andamento, lê o disco e marca o início
+  async pullNow(){
+    for(let i=0;i<200&&(DB.writing||DB.fila||DB.pulling);i++)await sleep(30);
+    if(DB.sujo&&!DB.offline){await DB.push();}
+    else await DB.pull(true);
+    DB._iniciarOp();
+  }
+};
+// tubo em conflito só porque uma solicitação NOVA deste PC o reservou? -> regra F resolve
+function _tuboDeSolicitacaoNova(lpn,B,L,R){
+  const ant=new Set([...(B.solicitacoes||[]),...(R.solicitacoes||[])].map(s=>s.id));
+  const novaComTubo=(L.solicitacoes||[]).some(s=>!ant.has(s.id)&&s.status==='PENDENTE'&&(s.reservados||[]).some(t=>t.lpn===lpn));
+  if(!novaComTubo)return false;
+  // fora a reserva nova, este PC não mexeu nesse tubo
+  const semNovas={...L,solicitacoes:(L.solicitacoes||[]).filter(s=>ant.has(s.id))};
+  return _sigTubo(_estadoTubos(semNovas).get(lpn))===_sigTubo(_estadoTubos(B).get(lpn));
+}
+// Faixa fixa no topo quando a pasta da rede não responde
+function _bannerRede(){
+  let b=document.getElementById('banner-rede');
+  const n=Object.keys(DB.naoEnviadas).length;
+  if(!DB.offline&&!n){if(b)b.style.display='none';return;}
+  if(!b){b=document.createElement('div');b.id='banner-rede';
+    b.style.cssText='position:fixed;top:0;left:0;right:0;z-index:99998;padding:9px 16px;font:700 13px/1.4 inherit;text-align:center;color:#fff;';
+    document.body.appendChild(b);}
+  b.style.display='block';
+  b.style.background=DB.offline?'#c0392b':'#e67e22';
+  b.textContent=DB.offline
+    ?'📡 SEM CONEXÃO com a pasta da rede'+(n?' — '+n+' solicitação(ões) NÃO enviada(s), ficam guardadas neste PC até a rede voltar':' — nada do que você fizer agora será gravado')
+    :'⏳ Enviando '+n+' solicitação(ões) feita(s) sem rede…';
 }
 
 // ═══ RECONEXÃO AUTOMÁTICA DE BANCO (IndexedDB) ═══
@@ -2031,7 +2271,7 @@ function _infoBancoAtivo(){
   el.textContent=(db._registro?'🛡️ '+db._registro.id+' · ':'')+db.usuarios.length+' usuários · '+db.historico.length+' requisições';
 }
 
-// ═══ CONEXÃO COM A PASTA DO SISTEMA (v13.0) ═══
+// ═══ CONEXÃO COM A PASTA DO SISTEMA (v13.1) ═══
 // A autorização é pedida UMA vez, para a pasta. O handle fica guardado no
 // IndexedDB, então nas próximas aberturas a reconexão é automática.
 async function _permissaoPasta(dh,pedir){
@@ -2040,14 +2280,17 @@ async function _permissaoPasta(dh,pedir){
   return p==='granted';
 }
 async function _concluirConexao(dh,silencioso){
-  const conf=await PASTA.ehPastaDoSistema(dh);
-  if(!conf){
-    if(silencioso)return false;
-    return await _oferecerMigracao(dh);
+  // (A) sem o arquivo de confirmação a pasta é recusada e NADA é criado
+  if(!await PASTA.confirmacao(dh)){
+    if(!silencioso)toast('❌ A pasta "'+dh.name+'" não é a pasta do Sistema de Solda: falta o arquivo '+PASTA.CONFIRMACAO+' com {"sistema":"SOLDA_MMT"}. Nada foi criado. Peça ao MMT a pasta correta.','err',12000);
+    return false;
   }
   let dados;
-  try{await PASTA.abrirHandles(dh,false);dados=await PASTA.carregar();}
-  catch(e){PASTA.zerar();toast('❌ Não consegui abrir o banco da pasta "'+dh.name+'": '+e.message,'err');return false;}
+  try{
+    await PASTA.abrirHandles(dh);
+    if(!await PASTA.temBanco()){if(silencioso||!await _migrarOuCriar(dh)){PASTA.zerar();return false;}}
+    dados=await PASTA.carregar();
+  }catch(e){PASTA.zerar();toast('❌ Não consegui abrir o banco da pasta "'+dh.name+'": '+e.message,'err');return false;}
   const erro=_validarEstruturaBanco(dados);
   if(erro){PASTA.zerar();toast('❌ Banco recusado: '+erro,'err');return false;}
   const _lb=_bancoLembrado(),ts=PASTA.indice.ts||0;
@@ -2056,40 +2299,50 @@ async function _concluirConexao(dh,silencioso){
   dbHandle=dh;DB.adotar(dados);_handleGuardar(dh);_reconectarUI(false);
   _bancoGuardar(db._registro&&db._registro.id,ts);
   PASTA.limparLogsVelhos();
+  // pedidos feitos SEM REDE antes de fechar o sistema: voltam e são conferidos
+  const n=DB.restaurarPendencias();
+  if(n){toast('⏳ '+n+' solicitação(ões) feita(s) sem rede neste PC serão conferidas com o estoque atual e enviadas.','warn',10000);setTimeout(()=>DB.push(),300);}
   dbLoaded(dh.name+' · '+PASTA.pcId());return true;
 }
-// Pasta sem SOLDA_PASTA_DO_SISTEMA.json: pode ser a pasta errada, ou a 1ª vez no formato novo.
-async function _oferecerMigracao(dh){
-  let temDados=false;try{await dh.getDirectoryHandle('dados');temDados=true;}catch(e){}
-  if(temDados){toast('❌ A pasta "'+dh.name+'" tem uma pasta "dados" mas não tem o '+PASTA.CONFIRMACAO+'. Não é a pasta do Sistema de Solda (ou o arquivo de confirmação foi apagado). Fale com o MMT.','err');return false;}
-  if(!confirm('A pasta "'+dh.name+'" ainda não tem o banco no formato novo (v13).\n\n'+
-    'Para CONVERTER, selecione em seguida o JSON antigo do banco (BANCO_SOLDA...json).\n'+
-    'O JSON antigo NÃO é apagado: uma cópia fica em dados/banco/bak/.\n\n'+
-    'ANTES DE CONTINUAR: feche o sistema em TODOS os outros computadores.\n\nContinuar?'))return false;
-  let fh;
-  try{[fh]=await window.showOpenFilePicker({types:[{description:'JSON',accept:{'application/json':['.json']}}],multiple:false});}
-  catch(e){return false;}
-  const f=await fh.getFile(),t=await f.text();let d;
-  try{d=JSON.parse(t);}catch(e){toast('Erro ao ler o JSON antigo.','err');return false;}
-  const er=_validarEstruturaBanco(d);if(er){toast('❌ JSON recusado: '+er,'err');return false;}
-  d=normalizarDB(d);
+// Pasta confirmada mas sem dados/banco: converte o JSON antigo que estiver na pasta
+async function _migrarOuCriar(dh){
+  const cands=[];
+  for await(const [n,h] of dh.entries()){
+    if(h.kind!=='file'||!/\.json$/i.test(n)||n===PASTA.CONFIRMACAO)continue;
+    try{const f=await h.getFile();const t=await f.text();const d=JSON.parse(t);
+      if(!_validarEstruturaBanco(d))cands.push({n,h,f,t,d});}catch(e){}
+  }
+  cands.sort((a,b)=>b.f.lastModified-a.f.lastModified);
+  if(!cands.length){
+    if(!confirm('A pasta "'+dh.name+'" não tem banco e não tem JSON antigo para converter.\n\nCriar um BANCO NOVO e VAZIO (só o usuário admin)?'))return false;
+    const d=normalizarDB(defDB());d._sistema=ASSINATURA_BANCO;d._registro=_novoRegistro();
+    await PASTA.criar(d,'banco novo');toast('✅ Banco novo criado.','ok');return true;
+  }
+  const c=cands[0];
+  if(!confirm('CONVERSÃO DO BANCO (uma vez só)\n\nArquivo: '+c.n+'\nÚltima alteração: '+new Date(c.f.lastModified).toLocaleString('pt-BR')+
+    '\nHistórico: '+(c.d.historico||[]).length+' · Solicitações: '+(c.d.solicitacoes||[]).length+' · Usuários: '+(c.d.usuarios||[]).length+
+    (cands.length>1?'\n(há '+cands.length+' JSON na pasta: foi escolhido o mais recente)':'')+
+    '\n\nO banco vai para dados/ e o JSON antigo vira '+c.n.replace(/\.json$/i,'')+'_MIGRADO_'+PASTA.hoje()+'.bak (nada é apagado).\n\nANTES: feche o sistema em TODOS os outros computadores.\n\nConverter agora?'))return false;
+  const d=normalizarDB(c.d);
   if(!d._sistema)d._sistema=ASSINATURA_BANCO;if(!d._registro)d._registro=_novoRegistro();
-  let n;
-  try{n=await PASTA.criar(dh,d,t,f.name);}
-  catch(e){PASTA.zerar();toast('❌ Conversão interrompida: '+e.message,'err');return false;}
-  PASTA.zerar();
-  toast('✅ Banco convertido: '+n+' registro(s) de histórico, '+(d.solicitacoes||[]).length+' solicitação(ões). O JSON antigo não será mais usado.','ok');
-  return await _concluirConexao(dh);
+  const nh=await PASTA.criar(d,c.n);
+  // o JSON antigo vira .bak (cópia conferida) e sai do lugar: PC com versão antiga não grava mais nele
+  const bak=c.n.replace(/\.json$/i,'')+'_MIGRADO_'+PASTA.hoje()+'.bak';
+  await PASTA.gravar(dh,bak,c.t,false);
+  try{await dh.removeEntry(c.n);}catch(e){toast('⚠️ Não consegui tirar o JSON antigo da pasta. Apague/renomeie '+c.n+' à mão.','warn',12000);}
+  toast('✅ Banco convertido: '+nh+' registro(s) de histórico, '+(d.solicitacoes||[]).length+' solicitação(ões). Cópia do antigo: '+bak,'ok',10000);
+  return true;
 }
 
 // ═══ DESCONECTAR / TROCAR DE PASTA ═══
 async function desconectarBanco(){
+  if(Object.keys(DB.naoEnviadas).length&&!confirm('Há solicitações feitas SEM REDE que ainda não foram enviadas. Elas ficam guardadas neste PC e serão enviadas quando você conectar de novo.\n\nContinuar?'))return;
   if(!confirm('Desconectar do banco atual?\n\nVocê voltará para a tela de login e poderá conectar outra pasta.'))return;
-  for(let i=0;i<60&&(DB.writing||DB.pending);i++)await sleep(50);
+  for(let i=0;i<100&&(DB.writing||DB.fila);i++)await sleep(50);
   if(cu)doLogout();
   clearInterval(_syncInt);_syncInt=null;
   await _handleEsquecer();
-  dbHandle=null;db=null;DB.base=null;DB.lastMod=0;DB.errCount=0;PASTA.zerar();
+  dbHandle=null;db=null;DB.base=null;DB.lastMod=0;DB.errCount=0;DB.sujo=false;DB.naoEnviadas={};DB.offline=false;PASTA.zerar();_bannerRede();
   const up=document.getElementById('db-upload-container');if(up)up.style.display='block';
   const am=document.getElementById('db-active-msg');if(am)am.style.display='none';
   const lf=document.getElementById('login-fields');if(lf){lf.style.opacity='0.35';lf.style.pointerEvents='none';}
@@ -2161,7 +2414,7 @@ function copyDbPath(){
 }
 
 function save(){return DB.push();}
-function setSync(t){const e=document.getElementById('tb-sync');if(e)e.textContent=t;const d=document.querySelector('.tb-sync');if(d)d.classList.toggle('err',/erro/i.test(t));}
+function setSync(t){const e=document.getElementById('tb-sync');if(e)e.textContent=t;const d=document.querySelector('.tb-sync');if(d)d.classList.toggle('err',/erro|sem conex|não salvo/i.test(t));}
 
 // ═══ LOGIN ═══
 document.getElementById('li-pass').addEventListener('keydown',e=>{if(e.key==='Enter')doLogin();});
@@ -3069,9 +3322,16 @@ async function confirmarReq(){
         lider:cu.nome,loginLider:cu.login,data:ag.data,hora:ag.hora,op,modelo:mod,tipo:'SOLICITACAO',
         chassi,qtdKit,invoice,pullList,fifo:r.fifo,solicitacaoId:solId});
     });
-    await save();
+    // saveNow: grava NA HORA. Nunca mostra OK sem ter gravado de verdade.
+    const res=await DB.push({aceitaOffline:true});
     const solFinal=(db.solicitacoes||[]).find(x=>x.id===solId);
-    const avisou=_avisosReserva.some(a=>a.sol.id===solId);_mostrarAvisosReserva();
+    if(!res.ok&&res.offline&&solFinal){
+      DB.marcarNaoEnviada(solId);
+      toast('📡 SEM CONEXÃO — solicitação NÃO enviada. Ela ficou PENDENTE neste PC e será conferida com o estoque atualizado quando a rede voltar. NÃO retire o tubo ainda.','err',15000);
+      renderMinhasSolic();return;
+    }
+    if(!res.ok){renderQuotaBar();renderMinhasSolic();onRqChange();renderRqFIFO();return;}   // conflito: aviso já mostrado
+    const avisou=(res.avisos||[]).some(a=>a.sol.id===solId);
     if(solFinal&&solFinal.status==='CANCELADA'){renderQuotaBar();renderMinhasSolic();onRqChange();renderRqFIFO();return;}
     if(!avisou)toast('Solicitação enviada ao MMT. Tubo(s) reservado(s): '+(solFinal?solFinal.reservados:reservados).map(r=>'#'+(r.fifo!=null?r.fifo:'–')).join(', ')+'. Retire no balcão.','ok');
     ['rq-op2','rq-plano-modelo','rq-chassi','rq-qtdkit','rq-invoice','rq-pulllist'].forEach(id=>document.getElementById(id).value='');
@@ -3092,7 +3352,7 @@ function renderMinhasSolic(){
   bar.style.display='block';
   bar.innerHTML=`<div style="background:#fff8e1;border:1.5px solid #ffe082;border-radius:8px;padding:10px 14px;">
     <div style="font-size:11px;font-weight:800;color:#e65100;text-transform:uppercase;letter-spacing:0.8px;margin-bottom:6px;">⏳ Aguardando o MMT entregar (${mn.length})</div>
-    ${mn.map(x=>`<div style="font-size:12px;color:#22394f;">• ${esc(x.modelo)} · ${x.qty} tubo(s) · ${esc(x.linha)} · OP ${esc(x.op)} <span class="muted">(${esc(x.data)} ${esc(x.hora)})</span></div>`).join('')}
+    ${mn.map(x=>`<div style="font-size:12px;color:#22394f;">• ${esc(x.modelo)} · ${x.qty} tubo(s) · ${esc(x.linha)} · OP ${esc(x.op)} <span class="muted">(${esc(x.data)} ${esc(x.hora)})</span>${DB.naoEnviadas[x.id]?' <b style="color:#c0392b;">📡 NÃO ENVIADA (sem conexão) — não retire o tubo</b>':''}</div>`).join('')}
   </div>`;
 }
 
@@ -3207,7 +3467,7 @@ async function entregarSolic(id){
       entregues.push('#'+fifoNum);
     }
     sol2.status='ENTREGUE';sol2.entreguePor=cu.nome;sol2.entregueEm=ag.data+' '+ag.hora;sol2.lpns=escolhidos;sol2.foraFifo=foraFifo;
-    await save();
+    if(!(await save()).ok)return;   // não gravou: a tela já foi desfeita e o aviso mostrado
     toast('Entregue para '+sol2.lider+': '+entregues.join(', ')+' → '+sol2.linha,'ok');
     _solicHash='';renderSolic();
   }finally{_solicBusy=false;}
@@ -3287,7 +3547,7 @@ async function aceitarSolicLote(){
       sol2.aceiteLote=true;sol2.semBaixaEstoque=!entregues.length;
       ok++;
     }
-    await save();
+    if(!(await save()).ok)return;   // não gravou: a tela já foi desfeita e o aviso mostrado
     _solicSel.clear();
     toast(ok+' pedido(s) aceito(s) · '+saidas+' tubo(s) saíram do estoque'+(ignorados?' · '+ignorados+' já tratado(s) em outro computador':''),'ok');
     _solicHash='';renderSolic();
@@ -3303,7 +3563,8 @@ async function cancelarSolic(id){
   if(!s2||s2.status!=='PENDENTE'){_solicHash='';renderSolic();return;}
   const ag=agora();
   s2.status='CANCELADA';s2.entreguePor=cu.nome;s2.entregueEm=ag.data+' '+ag.hora;
-  await save();toast('Solicitação cancelada.','ok');_solicHash='';renderSolic();
+  if(!(await save()).ok){_solicHash='';renderSolic();return;}
+  toast('Solicitação cancelada.','ok');_solicHash='';renderSolic();
 }
 
 let _reqBusy=false;
@@ -3514,6 +3775,9 @@ async function desfazerReq(id){
   const r=db.historico[idx];
   if(!r||(r.tipo&&r.tipo!=='SAIDA')){toast('Só é possível desfazer saídas.','err');return;}
   if(!confirm(`Desfazer requisição?\n\nSolda: ${r.lpn}\nFIFO #${r.tubo!=null?r.tubo:'–'} · ${r.linha} · OP: ${r.op||'–'}\n\nA solda volta ao início da fila.`))return;
+  await DB.pullNow();
+  const idx2=db.historico.findIndex(h=>h.id===id);
+  if(idx2<0){toast('Este registro já foi alterado em outro computador.','warn');renderHist();return;}
   if(!db.estoque[r.modelo])db.estoque[r.modelo]=[];
   if(!db.estoque[r.modelo].find(s=>s.lpn===r.lpn))db.estoque[r.modelo].unshift({lpn:r.lpn,addedAt:new Date().toISOString(),fifo:r.fifo!=null?r.fifo:r.tubo});
   if(db.emUso){
@@ -3522,8 +3786,8 @@ async function desfazerReq(id){
       if(i>=0){db.emUso[ln].splice(i,1);if(!db.emUso[ln].length)delete db.emUso[ln];}
     }
   }
-  db.historico.splice(idx,1);
-  await save();
+  db.historico.splice(idx2,1);
+  if(!(await save()).ok)return;
   toast(`Requisição desfeita — ${r.lpn} voltou ao estoque.`,'ok');
   renderHist();
 }
@@ -3589,7 +3853,7 @@ async function salvarEditHist(){
         break;
       }
     }
-    await save();
+    if(!(await save()).ok)return;   // não gravou: a tela já foi desfeita e o aviso mostrado
     closeM('m-edit-hist');
     toast('Corrigido: '+(liderAntigo||'–')+' / '+(linhaAntiga||'–')+' → '+lider+' / '+linha,'ok');
     renderHist();
@@ -4216,7 +4480,7 @@ async function aplicarCorrecao(){
     db.emUso[linha].push({lpn:lpnTenho,modelo:reg.modelo,lider:cu.nome,data:ag.data,hora:ag.hora,op,tubo:novo.tubo,fifo:fifoAntigo});
     // 5. registro da correção
     db.correcoes.push({id:novoId('c'),ts:ag.ts,data:ag.data,hora:ag.hora,status:'APLICADA',por:cu.nome,outro:nomeOutro,lpnPor:lpnTenho,lpnOutro,modelo:reg.modelo,linhaPor:linha,opPor:op,linhaOutro:reg.linha,opOutro:reg.op});
-    await save();
+    if(!(await save()).ok)return;   // não gravou: a tela já foi desfeita e o aviso mostrado
     toast(`Correção aplicada: você → ${lpnTenho} · ${nomeOutro} → ${lpnOutro}`,'ok');
     initCorrecao();
   }finally{btn.textContent='🔁 Aplicar Correção';corrResumo();}
@@ -4243,7 +4507,7 @@ async function limparCorrecoes(){
   if(!confirm('Apagar TODAS as '+qtd+' correções registradas?\n\nO histórico de requisições NÃO é afetado. Esta ação não tem volta.'))return;
   await DB.pullNow();
   db.correcoes=[];
-  await save();
+  if(!(await save()).ok)return;   // não gravou: a tela já foi desfeita e o aviso mostrado
   toast(qtd+' correção(ões) apagada(s).','ok');
   renderCorrLista();
 }
@@ -4256,13 +4520,17 @@ function renderCorrLegado(){
     <div style="display:flex;gap:6px;align-items:center;margin-top:6px;"><span class="tm">${esc(c.lpnEsperado)}</span><input class="fc" id="scan-inp-${c.id}" placeholder="Escaneie para assumir" style="flex:1;padding:5px 8px;font-size:12px;" autocomplete="off"><button class="btn bs btn-sm" onclick="assumirCorrecao('${c.id}')">Assumir</button></div>`).join('')}</div>`:'';
 }
 async function assumirCorrecao(id){
-  const corr=(db.correcoes||[]).find(c=>c.id===id);if(!corr)return;
+  let corr=(db.correcoes||[]).find(c=>c.id===id);if(!corr)return;
   const v=((document.getElementById('scan-inp-'+id)||{}).value||'').trim().toUpperCase();
   if(v!==corr.lpnEsperado){toast('Código não confere.','err');return;}
+  await DB.pullNow();
+  corr=(db.correcoes||[]).find(c=>c.id===id);
+  if(!corr||corr.status==='ASSUMIDO'){toast('Esta correção já foi tratada em outro computador.','warn');renderCorrLista();return;}
   const ag=agora();
   db.historico.push({id:novoId(),ts:ag.ts,tubo:corr.fifo,lpn:corr.lpnEsperado,linha:corr.linha,lider:cu.nome,loginLider:cu.login,data:ag.data,hora:ag.hora,op:corr.op,modelo:corr.modelo,tipo:'SAIDA',assumidoPorScan:true});
   corr.status='ASSUMIDO';corr.liderAssumiu=cu.nome;corr.dataAssumiu=ag.data;
-  await save();toast('Solda '+corr.lpnEsperado+' registrada no seu nome.','ok');renderCorrLista();
+  if(!(await save()).ok){renderCorrLista();return;}
+  toast('Solda '+corr.lpnEsperado+' registrada no seu nome.','ok');renderCorrLista();
 }
 
 // ═══ LIMPEZA DO BANCO (v10) ═══
@@ -4313,15 +4581,17 @@ function renderLimpeza(){
 }
 async function executarLimpeza(dias){
   if(!_limpezaAuth)return;
-  await DB.pullNow();
+  await DB.pull(true);
   const r=limpCalcular(dias);
   if(!r.remover.length){toast('Nada a remover.','warn');renderLimpeza();return;}
   if(!confirm(`Remover ${r.remover.length} registro(s) anteriores a ${r.corte.toLocaleDateString('pt-BR')}?\n\nUm Excel de backup será baixado antes.`))return;
   try{expXLSXBackup(r.remover,'BKP_Limpeza_'+dias+'d_');}catch(e){toast('Falha ao gerar o Excel — limpeza cancelada.','err');return;}
+  await DB.pullNow();
+  const r2=limpCalcular(dias);
   const ag=agora();
-  db.historico=r.manter;
+  db.historico=r2.manter;
   db.limpezas.push({id:novoId('l'),ts:ag.ts,data:ag.data,hora:ag.hora,por:cu.nome,dias,removidos:r.remover.length});
-  await save();
+  if(!(await save()).ok)return;   // não gravou: a tela já foi desfeita e o aviso mostrado
   toast(`${r.remover.length} registro(s) removido(s). Mantidos ${dias} dias.`,'ok');
   renderLimpeza();
 }
@@ -4822,10 +5092,10 @@ function toggleSidebar(){
 function closeM(id){document.getElementById(id).style.display='none';}
 document.querySelectorAll('.mbg').forEach(m=>m.addEventListener('click',e=>{if(e.target===m)m.style.display='none';}));
 
-function toast(msg,type=''){
+function toast(msg,type='',ms){
   const c=document.getElementById('toasts');
   const t=document.createElement('div');t.className='toast '+type;t.textContent=msg;c.appendChild(t);
-  setTimeout(()=>t.remove(),4000);
+  setTimeout(()=>t.remove(),ms||4000);
 }
 
 // Tenta reconectar o último banco usado ao abrir a página

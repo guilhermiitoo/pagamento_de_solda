@@ -1,7 +1,7 @@
 // TESTE DE REDE v13 — Simulador: vários "PCs" (contextos isolados) gravando na mesma pasta em memória.
 const vm=require('vm'),fs=require('fs');
 // uso: node teste-pasta.js [banco.json] [html]    LAT=40 node teste-pasta.js ...  (latência por operação, ms)
-const HTML=process.argv[3]||__dirname+'/../TPV_SolderControl_v13_0.html';
+const HTML=process.argv[3]||__dirname+'/../TPV_SolderControl_v13_1.html';
 const APP=fs.readFileSync(HTML,'utf8').match(/<script>([\s\S]*?)<\/script>/)[1];
 const rnd=(a,b)=>a+Math.random()*(b-a);
 const LAT=+process.env.LAT||3;   // latência média (ms) de cada operação de arquivo
@@ -39,14 +39,14 @@ function novoPC(nome){
   vm.createContext(ctx);
   ls['tpv_solda_pc_id']=nome;
   vm.runInContext(APP+`
-    ;globalThis.__=()=>({PASTA,DB,get db(){return db},set db(v){db=v},set dbHandle(v){dbHandle=v},set cu(v){cu=v},normalizarDB,_avisosReserva,filaLivre,agora,novoId,save});
+    ;globalThis.__=()=>({PASTA,DB,get db(){return db},set db(v){db=v},set dbHandle(v){dbHandle=v},set cu(v){cu=v},normalizarDB,_concluirConexao,filaLivre,agora,novoId,save});
     toast=(m,t)=>__toasts.push([t,m]);refreshView=()=>{};setSync=()=>{};`,ctx);
   ctx.__toasts=toasts;
   const api=ctx.__();api.toasts=toasts;api.nome=nome;
   return api;
 }
 async function conectar(pc,raiz){
-  await pc.PASTA.abrirHandles(raiz,false);
+  await pc.PASTA.abrirHandles(raiz);
   const d=await pc.PASTA.carregar();pc.dbHandle=raiz;pc.DB.adotar(d);
 }
 // cópia exata do fluxo de confirmarReq (sem a tela)
@@ -70,15 +70,15 @@ const resumo=d=>JSON.stringify({e:d.estoque,u:d.emUso,s:d.solicitacoes,h:d.histo
   const raiz=new DH('BD Solda');
   console.log('1) Migração do JSON real');
   const A=novoPC('PC-A');
-  const dA=A.normalizarDB(JSON.parse(JSON.stringify(banco)));
-  const n=await A.PASTA.criar(raiz,dA,JSON.stringify(banco),'BANCO.json');A.PASTA.zerar();
-  await conectar(A,raiz);
-  ok(n===banco.historico.length,'histórico migrado: '+n+' de '+banco.historico.length);
+  const put=(nome,txt)=>raiz.files.set(nome,{b:Buffer.from(txt,'utf8'),mt:Date.now()});
+  put('BANCO_SOLDA.json',JSON.stringify(banco));
+  ok(await A._concluirConexao(raiz)===false&&!raiz.dirs.has('dados'),'pasta sem SOLDA_PASTA_DO_SISTEMA.json: recusada, nada criado');
+  put('SOLDA_PASTA_DO_SISTEMA.json','{"sistema":"SOLDA_MMT"}');
+  ok(await A._concluirConexao(raiz)===true,'com a confirmação: JSON antigo convertido e banco aberto');
+  ok(A.db.historico.length===banco.historico.length,'histórico migrado: '+A.db.historico.length+' de '+banco.historico.length);
   ok(A.db.solicitacoes.length===banco.solicitacoes.length&&A.db.usuarios.length===banco.usuarios.length,'solicitações e usuários iguais');
   ok(JSON.stringify(A.db.estoque)===JSON.stringify(banco.estoque),'estoque idêntico');
-  ok(!!(await A.PASTA.ler(raiz,'SOLDA_PASTA_DO_SISTEMA.json')),'arquivo de confirmação criado');
-  const bak=raiz.dirs.get('dados').dirs.get('banco').dirs.get('bak');
-  ok(bak&&[...bak.files.keys()].some(k=>k.startsWith('JSON_ANTIGO_')),'JSON antigo guardado em bak/');
+  ok([...raiz.files.keys()].some(k=>/^BANCO_SOLDA_MIGRADO_.*\.bak$/.test(k))&&!raiz.files.has('BANCO_SOLDA.json'),'JSON antigo virou BANCO_SOLDA_MIGRADO_<data>.bak');
   // banco de teste: 10 tubos livres de TTX
   A.db.modelos.push({prefixo:'TTX',descricao:'teste'});
   A.db.estoque.TTX=Array.from({length:10},(_,i)=>({lpn:'TTX'+String(i+1).padStart(3,'0'),fifo:i+1}));
@@ -102,8 +102,7 @@ const resumo=d=>JSON.stringify({e:d.estoque,u:d.emUso,s:d.solicitacoes,h:d.histo
   const hs=PCS[0].db.historico.filter(h=>h.tipo==='SOLICITACAO'&&h.modelo==='TTX');
   ok(hs.length===10&&new Set(hs.map(h=>h.lpn)).size===10,'histórico bate com as reservas ('+hs.length+' linhas)');
   ok(PCS.every(p=>resumo(p.db)===resumo(PCS[0].db)),'os 4 PCs terminaram com o MESMO banco');
-  const avisos=PCS.flatMap(p=>p._avisosReserva.length?p._avisosReserva:[]);
-  console.log('     (trocas/cancelamentos automáticos pela trava: '+PCS.reduce((a,p)=>a+p._avisosReserva.length,0)+')');
+  console.log('     (trocas/cancelamentos automáticos pela trava: '+PCS.reduce((a,p)=>a+p.toasts.filter(t=>/já tinha sido/.test(t[1])).length,0)+')');
 
   console.log('3) Edição e exclusão no histórico em PCs diferentes');
   const alvo=PCS[1].db.historico[5].id,apagar=PCS[2].db.historico[6].id;

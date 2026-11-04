@@ -2,7 +2,7 @@
 const fs=require('fs');
 const {chromium}=require('playwright');
 const RAIZ=require('path').join(__dirname,'..');
-const ARQ=RAIZ+'/TPV_SolderControl_v13_0.html';
+const ARQ=RAIZ+'/TPV_SolderControl_v13_1.html';
 const BANCO=fs.readFileSync(RAIZ+'/ARQUIVO LIMPO 10-06 .json','utf8');
 
 (async()=>{

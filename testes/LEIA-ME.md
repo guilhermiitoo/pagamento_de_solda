@@ -1,11 +1,12 @@
 # Testes do Sistema de Solda
 
-Rodam contra o próprio `TPV_SolderControl_v13_0.html`, sem servidor e sem internet.
+Rodam contra o próprio `TPV_SolderControl_v13_1.html`, sem servidor e sem internet.
 
 ```bash
 cd testes
 node teste-peso.js          # leitura do peso da planilha do WH e classificação da OP
 node teste-pasta.js         # 4 PCs gravando juntos na pasta dados/ (trava, token, migração)
+node teste-salvamento.js    # Chrome de verdade, 2 PCs: mesmo tubo, tubos diferentes, PC sem Wi-Fi, 2 MMT no mesmo pedido
 node teste-dados-reais.js   # análise ponta a ponta com o banco real do usuário
 
 npm i playwright            # só para os dois abaixo (abrem um Chrome de verdade)
