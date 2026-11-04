@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>TPV – Controle de Pagamento de Solda v12.3</title>
+<title>TPV – Controle de Pagamento de Solda v13.0</title>
 <!-- v12.0: 100% OFFLINE. Nenhum recurso é buscado na internet.
      A política abaixo bloqueia qualquer tentativa de acesso externo (http/https),
      mesmo que algum trecho futuro tente. Fonte, gráficos e leitor de planilha
@@ -551,7 +551,7 @@ textarea.fc{resize:vertical;min-height:75px;}
 
       <!-- Caminho do arquivo -->
       <div style="text-align:left;margin-bottom:12px;">
-        <div style="font-size:9px;font-weight:700;color:#a0aec0;text-transform:uppercase;letter-spacing:0.8px;margin-bottom:4px;">Caminho do Banco de Dados</div>
+        <div style="font-size:9px;font-weight:700;color:#a0aec0;text-transform:uppercase;letter-spacing:0.8px;margin-bottom:4px;">Pasta do Sistema (escolha esta pasta)</div>
         <div style="display:flex;border:1.5px solid #d0d8e4;border-radius:7px;overflow:hidden;background:#fff;">
           <input type="text" id="db-path-txt" readonly value="R:\GLOBAL\R.A - MMT-WH-PCM-PD-RP-QC\02 - BD Solda"
             style="flex:1;padding:7px 10px;font-size:10px;font-family:monospace;font-weight:600;color:#344963;background:#f4f6f9;border:none;outline:none;min-width:0;">
@@ -564,13 +564,13 @@ textarea.fc{resize:vertical;min-height:75px;}
       <!-- Botão de reconexão (escondido até existir arquivo lembrado) -->
       <button id="db-btn-reconectar" onclick="reconectarBanco()"
         style="display:none;width:100%;padding:10px 14px;margin-bottom:8px;background:#16a34a;color:#fff;border:none;border-radius:8px;font-size:12px;font-weight:700;font-family:inherit;cursor:pointer;letter-spacing:0.3px;">
-        ⚡ Reconectar Banco (último arquivo usado)
+        ⚡ Reconectar Banco (última pasta usada)
       </button>
 
       <!-- Botão selecionar arquivo -->
       <button id="db-btn-el" onclick="selectDB()"
         style="width:100%;padding:10px 14px;background:#0d1b2e;color:#fff;border:none;border-radius:8px;font-size:12px;font-weight:700;font-family:inherit;cursor:pointer;letter-spacing:0.3px;">
-        📂 Selecionar Arquivo .JSON
+        📂 Selecionar Pasta do Sistema
       </button>
     </div>
 
@@ -1487,8 +1487,20 @@ textarea.fc{resize:vertical;min-height:75px;}
        de soldas em uso da linha. Toda edição fica gravada (quem, quando, antes/depois e
        motivo) e o registro ganha o ícone ✏️ com essas informações.
      - Etiqueta e regras de pagamento existentes: sem alteração.
+   v12.3 (04/11/2026)
+     - Trava de reserva duplicada (_resolverReservas): duas líderes não ficam mais com o
+       mesmo tubo. Quem gravou primeiro fica com ele; a outra recebe o próximo livre.
+   v13.0 (04/11/2026) — mesmo motor de gravação do Spare Parts v17.52
+     - O banco deixa de ser um JSON único: agora é uma PASTA (dados/banco, movimentos, logs).
+       Só o arquivo que mudou é regravado. Histórico append-only, 1 arquivo por PC por dia.
+     - Trava .lock + token por arquivo no indice.json: nenhum PC grava por cima de outro.
+       Conferência final relendo o que gravou; se outro PC gravou junto, refaz o merge.
+     - Migração automática: na 1ª vez, escolha a pasta e depois o JSON antigo. O JSON
+       antigo é copiado para dados/banco/bak/ e não é mais usado.
+     - Corrigido: alteração ainda não gravada podia ser apagada pelo sync de 2s
+       (janela de 60ms entre uma gravação e a próxima).
    ═══════════════════════════════════════════════════════════════ */
-const VERSAO='v12.2';
+const VERSAO='v13.0';
 
 // ═══ DATABASE ═══
 let dbHandle=null, db=null, cu=null, _syncInt=null, _clockInt=null, _tab='';
@@ -1543,98 +1555,335 @@ function normalizarDB(d){
   return d;
 }
 
-// ── Motor de sincronização (padrão SPARE_PARTS v16) ──
+// ══════════════════════════════════════════════════════════════════════
+// v13.0 — BANCO EM PASTA (mesmo motor do Spare Parts v17.52)
+//
+//   <pasta escolhida>/
+//     SOLDA_PASTA_DO_SISTEMA.json   <- confirmação: recusa pasta errada
+//     dados/banco/indice.json       <- manifesto (~1KB). O sync de 2s lê SÓ ele.
+//     dados/banco/estoque.json      <- estoque FIFO, tubos em uso, sequência FIFO
+//     dados/banco/solicitacoes.json <- pedidos das líderes (com as reservas)
+//     dados/banco/usuarios.json     <- usuários, modelos, linhas, identidade do banco
+//     dados/banco/config.json       <- correções, limpezas, plano do WH, demais campos
+//     dados/banco/bak/*.bak         <- cópia anterior de cada arquivo (máx. 1 a cada 5 min)
+//     dados/banco/.lock             <- trava de gravação {id, pc, ts}
+//     dados/movimentos/AAAA-MM-DD__PC.jsonl <- histórico append-only, 1 arquivo por PC por dia
+//     dados/logs/AAAA-MM-DD__PC.jsonl       <- log de gravações (apagado após 90 dias)
+//
+// REGRAS
+//   • Só o arquivo que mudou é regravado.
+//   • Gravação só com a trava. Já travado, relê o índice: se o token de algum
+//     arquivo mudou, outro PC gravou -> relê esse arquivo, refaz o merge
+//     (incluindo _resolverReservas) e só então grava. Nada é sobrescrito.
+//   • Cada PC só escreve no SEU arquivo de movimentos: o histórico nunca é disputado.
+//     No arquivo vale a última linha de cada id (carimbo _s). Exclusão = linha {_del}.
+//   • Toda gravação é conferida pelo tamanho (detecta arquivo truncado na rede).
+// ══════════════════════════════════════════════════════════════════════
+const PASTA={
+  ESQUEMA:1, CONFIRMACAO:'SOLDA_PASTA_DO_SISTEMA.json', INDICE:'indice.json', LOCK:'.lock',
+  LOCK_VALIDADE:8000, LOCK_ESPERA:6000, TENTATIVAS:5,
+  HIST_DIAS:120,     // dias de movimentos carregados na tela (os arquivos NÃO são apagados)
+  LOGS_DIAS:90,      // logs mais velhos que isso são apagados
+  DOMINIOS:['estoque','solicitacoes','usuarios','config'],
+  CAMPOS:{estoque:['estoque','emUso','fifoSeq','cTubo'],solicitacoes:['solicitacoes'],
+          usuarios:['usuarios','modelos','linhas','_v','_sistema','_registro']},
+  raiz:null,dados:null,banco:null,mov:null,logs:null,
+  indice:null,indiceTxt:'',bruto:{},ultBak:{},seqTk:0,
+  hist:new Map(),      // id -> {s, rec|null}   (tudo que veio dos arquivos de movimentos)
+  escrito:new Map(),   // id -> assinatura já gravada (ou '__DEL__')
+  lido:{},             // arquivo de movimentos -> bytes já consumidos
+  logPend:[],
+
+  pcId(){
+    let id=null;try{id=localStorage.getItem('tpv_solda_pc_id');}catch(e){}
+    if(!id){id='PC-'+Math.random().toString(36).slice(2,8).toUpperCase();try{localStorage.setItem('tpv_solda_pc_id',id);}catch(e){}}
+    return id;
+  },
+  hoje(d){d=d||new Date();const p=n=>String(n).padStart(2,'0');return d.getFullYear()+'-'+p(d.getMonth()+1)+'-'+p(d.getDate());},
+  diaCorte(dias){return PASTA.hoje(new Date(Date.now()-dias*86400000));},
+  shardHoje(){return PASTA.hoje()+'__'+PASTA.pcId()+'.jsonl';},
+  novoToken(){PASTA.seqTk=(PASTA.seqTk+1)%100000;return Date.now().toString(36)+'-'+PASTA.pcId()+'-'+PASTA.seqTk;},
+  tokenDe(idx,dom){const a=(idx&&idx.arquivos&&idx.arquivos[dom])||{};return a.tk||'';},
+
+  // ---------- arquivos ----------
+  async ler(dir,nome){
+    try{return await (await (await dir.getFileHandle(nome)).getFile()).text();}
+    catch(e){if(e.name==='NotFoundError'||e.name==='TypeError')return null;throw e;}
+  },
+  async gravar(dir,nome,txt,bak,semVerificar){
+    if(bak&&Date.now()-(PASTA.ultBak[nome]||0)>5*60*1000){
+      try{const ant=await PASTA.ler(dir,nome);
+        if(ant&&ant!==txt){const bd=await dir.getDirectoryHandle('bak',{create:true});
+          const w=await (await bd.getFileHandle(nome+'.bak',{create:true})).createWritable();await w.write(ant);await w.close();PASTA.ultBak[nome]=Date.now();}
+      }catch(e){/* .bak nunca impede a gravação */}
+    }
+    const fh=await dir.getFileHandle(nome,{create:true});
+    const w=await fh.createWritable();await w.write(txt);await w.close();
+    if(!semVerificar){const bytes=new TextEncoder().encode(txt).length,conf=await fh.getFile();
+      if(conf.size!==bytes)throw new Error('gravação incompleta em '+nome+' ('+conf.size+' de '+bytes+' bytes)');}
+  },
+  async anexar(dir,nome,txt){
+    const fh=await dir.getFileHandle(nome,{create:true});
+    const pos=(await fh.getFile()).size;
+    const w=await fh.createWritable({keepExistingData:true});await w.seek(pos);await w.write(txt);await w.close();
+    const fim=pos+new TextEncoder().encode(txt).length,conf=await fh.getFile();
+    if(conf.size<fim)throw new Error('gravação incompleta em '+nome);
+    return fim;
+  },
+
+  // ---------- trava (escreve e confere) ----------
+  async pegarTrava(){
+    const meu=PASTA.pcId()+'-'+Date.now().toString(36)+'-'+Math.random().toString(36).slice(2,8),ini=Date.now();
+    while(Date.now()-ini<PASTA.LOCK_ESPERA){
+      const atual=await PASTA.ler(PASTA.banco,PASTA.LOCK);
+      if(atual){let o=null;try{o=JSON.parse(atual);}catch(e){}
+        if(o&&o.id!==meu&&Date.now()-(o.ts||0)<PASTA.LOCK_VALIDADE){await sleep(40+Math.random()*90);continue;}}
+      await PASTA.gravar(PASTA.banco,PASTA.LOCK,JSON.stringify({id:meu,pc:PASTA.pcId(),ts:Date.now()}),false,true);
+      // confere DUAS vezes: na rede, a gravação de outro PC pode chegar depois da 1ª conferência
+      await sleep(25+Math.random()*45);
+      let minha=false;try{minha=JSON.parse(await PASTA.ler(PASTA.banco,PASTA.LOCK)).id===meu;}catch(e){}
+      if(minha){await sleep(60+Math.random()*80);try{if(JSON.parse(await PASTA.ler(PASTA.banco,PASTA.LOCK)).id===meu)return meu;}catch(e){}}
+      await sleep(40+Math.random()*120);
+    }
+    return null;
+  },
+  async soltarTrava(meu){
+    try{const a=await PASTA.ler(PASTA.banco,PASTA.LOCK);if(a&&JSON.parse(a).id===meu)await PASTA.banco.removeEntry(PASTA.LOCK);}catch(e){}
+  },
+
+  // ---------- divide / junta o banco ----------
+  fatiar(d){
+    const out={},usados=new Set(['historico']);
+    ['estoque','solicitacoes','usuarios'].forEach(dom=>{const o={};PASTA.CAMPOS[dom].forEach(k=>{usados.add(k);if(d[k]!==undefined)o[k]=d[k];});out[dom]=JSON.stringify(o);});
+    const cfg={};Object.keys(d).forEach(k=>{if(!usados.has(k))cfg[k]=d[k];});out.config=JSON.stringify(cfg);
+    return out;
+  },
+  juntar(partes){
+    const d={};PASTA.DOMINIOS.forEach(dom=>{if(partes[dom])Object.assign(d,JSON.parse(partes[dom]));});
+    d.historico=PASTA.historicoAtual();return d;
+  },
+  historicoAtual(){const a=[];PASTA.hist.forEach(v=>{if(v.rec)a.push(v.rec);});return a.sort((x,y)=>(x.ts||0)-(y.ts||0));},
+  assinatura(r){const {_s,_w,...resto}=r;return JSON.stringify(resto);},
+
+  // aplica linhas de um arquivo de movimentos (vale a mais nova de cada id)
+  aplicarLinhas(txt){
+    let n=0;
+    txt.split('\n').forEach(l=>{if(!l.trim())return;let o;try{o=JSON.parse(l);}catch(e){return;}
+      if(!o||!o.id)return;const id=String(o.id),s=o._s||0,ja=PASTA.hist.get(id);
+      if(ja&&ja.s>s)return;
+      if(o._del){PASTA.hist.set(id,{s,rec:null});PASTA.escrito.set(id,'__DEL__');}
+      else{const {_s,_w,...rec}=o;PASTA.hist.set(id,{s,rec});PASTA.escrito.set(id,PASTA.assinatura(rec));}
+      n++;});
+    return n;
+  },
+  async lerShard(nome,desde){
+    const f=await (await PASTA.mov.getFileHandle(nome)).getFile();
+    const txt=await f.slice(desde||0).text();
+    const corte=txt.lastIndexOf('\n');if(corte<0)return 0;           // linha ainda sendo escrita
+    PASTA.lido[nome]=(desde||0)+new TextEncoder().encode(txt.slice(0,corte+1)).length;
+    return PASTA.aplicarLinhas(txt.slice(0,corte+1));
+  },
+  shardsVisiveis(idx){const c=PASTA.diaCorte(PASTA.HIST_DIAS);return Object.keys((idx&&idx.movimentos)||{}).filter(n=>n.slice(0,10)>=c).sort();},
+
+  // ---------- abrir a pasta ----------
+  async ehPastaDoSistema(dh){
+    try{const o=JSON.parse(await PASTA.ler(dh,PASTA.CONFIRMACAO));return o&&o.sistema===ASSINATURA_BANCO?o:null;}catch(e){return null;}
+  },
+  async abrirHandles(dh,criar){
+    PASTA.raiz=dh;
+    PASTA.dados=await dh.getDirectoryHandle('dados',{create:!!criar});
+    PASTA.banco=await PASTA.dados.getDirectoryHandle('banco',{create:!!criar});
+    PASTA.mov=await PASTA.dados.getDirectoryHandle('movimentos',{create:true});
+    PASTA.logs=await PASTA.dados.getDirectoryHandle('logs',{create:true});
+  },
+  zerar(){PASTA.raiz=PASTA.dados=PASTA.banco=PASTA.mov=PASTA.logs=null;PASTA.indice=null;PASTA.indiceTxt='';PASTA.bruto={};PASTA.hist=new Map();PASTA.escrito=new Map();PASTA.lido={};PASTA.logPend=[];},
+  // Lê o banco inteiro (só na conexão)
+  async carregar(){
+    const txt=await PASTA.ler(PASTA.banco,PASTA.INDICE);
+    if(!txt)throw new Error('banco não encontrado em dados/banco/indice.json');
+    const idx=JSON.parse(txt);
+    if((idx.schema||0)>PASTA.ESQUEMA)throw new Error('o banco foi gravado por uma versão mais nova do sistema. Atualize o HTML.');
+    const partes={};
+    for(const dom of PASTA.DOMINIOS){const t=await PASTA.ler(PASTA.banco,dom+'.json');partes[dom]=t||'{}';}
+    PASTA.hist=new Map();PASTA.escrito=new Map();PASTA.lido={};
+    for(const nome of PASTA.shardsVisiveis(idx)){try{await PASTA.lerShard(nome,0);}catch(e){console.warn('[movimentos]',nome,e);}}
+    PASTA.indice=idx;PASTA.indiceTxt=txt;PASTA.bruto=partes;
+    return PASTA.juntar(partes);
+  },
+  // Cria a estrutura nova a partir de um banco (JSON antigo ou banco novo)
+  async criar(dh,d,txtAntigo,nomeAntigo){
+    await PASTA.abrirHandles(dh,true);
+    if(await PASTA.ler(PASTA.banco,PASTA.INDICE))throw new Error('já existe um banco nesta pasta (dados/banco/indice.json)');
+    if(txtAntigo){const bd=await PASTA.banco.getDirectoryHandle('bak',{create:true});
+      await PASTA.gravar(bd,'JSON_ANTIGO_'+PASTA.hoje()+'__'+String(nomeAntigo||'banco').replace(/[^\w.-]/g,'_')+'.bak',txtAntigo,false);}
+    const idx={schema:PASTA.ESQUEMA,ts:Date.now(),arquivos:{},movimentos:{},logs:{},
+      migradoDe:nomeAntigo||null,migradoEm:new Date().toLocaleString('pt-BR'),migradoPor:PASTA.pcId()};
+    const partes=PASTA.fatiar(d);
+    for(const dom of PASTA.DOMINIOS){await PASTA.gravar(PASTA.banco,dom+'.json',partes[dom],false);idx.arquivos[dom]={tk:PASTA.novoToken(),t:Date.now()};}
+    const ag=Date.now(),hist=d.historico||[];
+    if(hist.length){
+      const nome=PASTA.hoje()+'__'+PASTA.pcId()+'.jsonl';
+      const txt=hist.map(h=>JSON.stringify(Object.assign({},h,{_s:ag,_w:PASTA.pcId()}))).join('\n')+'\n';
+      idx.movimentos[nome]=await PASTA.anexar(PASTA.mov,nome,txt);
+    }
+    await PASTA.gravar(PASTA.banco,PASTA.INDICE,JSON.stringify(idx,null,1),false);
+    await PASTA.gravar(dh,PASTA.CONFIRMACAO,JSON.stringify({sistema:ASSINATURA_BANCO,id:d._registro&&d._registro.id,
+      criadoEm:new Date().toLocaleString('pt-BR'),aviso:'Não apague. Identifica esta pasta como a do Sistema de Solda.'},null,1),false);
+    return hist.length;
+  },
+
+  // ---------- sync: lê só o índice e o que mudou ----------
+  // Devolve null (nada mudou) ou {partes, histMudou}
+  async lerMudancas(){
+    const txt=await PASTA.ler(PASTA.banco,PASTA.INDICE);
+    if(!txt||txt===PASTA.indiceTxt)return null;
+    let idx;try{idx=JSON.parse(txt);}catch(e){return null;}   // índice sendo escrito: próximo ciclo
+    const mudou={};
+    for(const dom of PASTA.DOMINIOS){
+      if(PASTA.tokenDe(idx,dom)===PASTA.tokenDe(PASTA.indice,dom))continue;
+      const t=await PASTA.ler(PASTA.banco,dom+'.json');
+      if(t==null)continue;try{JSON.parse(t);}catch(e){return null;}  // arquivo pela metade: tenta de novo
+      mudou[dom]=t;
+    }
+    let histMudou=false;
+    for(const nome of PASTA.shardsVisiveis(idx)){
+      if((PASTA.lido[nome]||0)>=idx.movimentos[nome])continue;
+      try{if(await PASTA.lerShard(nome,PASTA.lido[nome]||0))histMudou=true;}catch(e){}
+    }
+    // só dá o índice como lido se todos os movimentos dele chegaram (SMB pode atrasar)
+    const completo=PASTA.shardsVisiveis(idx).every(n=>(PASTA.lido[n]||0)>=idx.movimentos[n]);
+    PASTA.indice=idx;PASTA.indiceTxt=completo?txt:'';
+    Object.assign(PASTA.bruto,mudou);
+    return (Object.keys(mudou).length||histMudou)?{mudou,histMudou}:null;
+  },
+
+  // ---------- gravação ----------
+  log(acao){PASTA.logPend.push({ts:Date.now(),data:new Date().toLocaleString('pt-BR'),pc:PASTA.pcId(),login:cu?cu.login:'',nome:cu?cu.nome:'',acao});},
+
+  // Grava o db. Chamado com a trava JÁ obtida e o merge JÁ feito.
+  async gravarTudo(d){
+    const idx=JSON.parse(JSON.stringify(PASTA.indice||{schema:PASTA.ESQUEMA,arquivos:{},movimentos:{},logs:{}}));
+    idx.arquivos=idx.arquivos||{};idx.movimentos=idx.movimentos||{};idx.logs=idx.logs||{};
+    const partes=PASTA.fatiar(d),escritos=[],antes=Object.assign({},PASTA.bruto);
+    for(const dom of PASTA.DOMINIOS){
+      if(partes[dom]===PASTA.bruto[dom])continue;               // não mudou: zero bytes na rede
+      await PASTA.gravar(PASTA.banco,dom+'.json',partes[dom],true);
+      PASTA.bruto[dom]=partes[dom];idx.arquivos[dom]={tk:PASTA.novoToken(),t:Date.now()};escritos.push(dom);
+    }
+    // histórico: só linhas novas/alteradas e exclusões, no arquivo DESTE PC
+    const ag=Date.now(),linhas=[],vivos=new Set(),marcar=[];
+    (d.historico||[]).forEach(h=>{if(!h||!h.id)return;const id=String(h.id);vivos.add(id);
+      const a=PASTA.assinatura(h);if(PASTA.escrito.get(id)===a)return;
+      linhas.push(JSON.stringify(Object.assign({},h,{_s:ag,_w:PASTA.pcId()})));marcar.push([id,a,h]);});
+    PASTA.escrito.forEach((a,id)=>{if(a!=='__DEL__'&&!vivos.has(id)){linhas.push(JSON.stringify({id,_del:1,_s:ag,_w:PASTA.pcId()}));marcar.push([id,'__DEL__',null]);}});
+    if(linhas.length){
+      const nome=PASTA.shardHoje();
+      const fim=await PASTA.anexar(PASTA.mov,nome,linhas.join('\n')+'\n');
+      idx.movimentos[nome]=fim;PASTA.lido[nome]=fim;
+      marcar.forEach(([id,a,h])=>{PASTA.escrito.set(id,a);PASTA.hist.set(id,{s:ag,rec:h?JSON.parse(JSON.stringify(h)):null});});
+      escritos.push('movimentos('+linhas.length+')');
+    }
+    if(!escritos.length)return escritos;
+    // os arquivos de movimentos DESTE PC sempre entram no índice (se outro PC
+    // regravou o índice por cima, eles voltam aqui)
+    const meu='__'+PASTA.pcId()+'.';
+    Object.keys(PASTA.lido).forEach(n=>{if(n.includes(meu)&&(idx.movimentos[n]||0)<PASTA.lido[n])idx.movimentos[n]=PASTA.lido[n];});
+    PASTA.log(escritos.join(', '));
+    const lg=PASTA.logPend.splice(0);
+    try{const nome=PASTA.shardHoje();idx.logs[nome]=await PASTA.anexar(PASTA.logs,nome,lg.map(x=>JSON.stringify(x)).join('\n')+'\n');}
+    catch(e){console.warn('[logs]',e);}
+    const corteLog=PASTA.diaCorte(PASTA.LOGS_DIAS);Object.keys(idx.logs).forEach(n=>{if(n.slice(0,10)<corteLog)delete idx.logs[n];});
+    idx.schema=PASTA.ESQUEMA;idx.ts=Date.now();
+    const txt=JSON.stringify(idx,null,1);
+    await PASTA.gravar(PASTA.banco,PASTA.INDICE,txt,false);   // índice SEMPRE por último
+    // CONFERÊNCIA FINAL: espera um instante e relê tudo que gravou. Se outro PC
+    // gravou por cima (duas máquinas acharam que tinham a trava), desfaz a
+    // marcação local e devolve erro: o push relê, refaz o merge e grava de novo.
+    await sleep(120+Math.random()*120);
+    const conferir=[[PASTA.INDICE,txt]].concat(escritos.filter(e=>PASTA.DOMINIOS.includes(e)).map(dom=>[dom+'.json',partes[dom]]));
+    for(const [nome,esperado] of conferir){
+      if(await PASTA.ler(PASTA.banco,nome)!==esperado){
+        escritos.filter(e=>PASTA.DOMINIOS.includes(e)).forEach(dom=>{PASTA.bruto[dom]=antes[dom];});
+        PASTA.indiceTxt='';
+        const e=new Error('outro PC gravou ao mesmo tempo ('+nome+')');e.conflito=true;throw e;
+      }
+    }
+    PASTA.indice=idx;PASTA.indiceTxt=txt;
+    return escritos;
+  },
+  // apaga logs com mais de 90 dias (1x por sessão, silencioso)
+  async limparLogsVelhos(){
+    try{const c=PASTA.diaCorte(PASTA.LOGS_DIAS),apagar=[];
+      for await(const [n,h] of PASTA.logs.entries())if(h.kind==='file'&&/^\d{4}-\d{2}-\d{2}__/.test(n)&&n.slice(0,10)<c)apagar.push(n);
+      for(const n of apagar)await PASTA.logs.removeEntry(n).catch(()=>{});
+    }catch(e){}
+  }
+};
+
+// ── Motor de sincronização (v13.0: em cima da PASTA) ──
 const DB={
-  base:null,lastMod:0,lastSize:-1,lastJson:'',writing:false,pending:false,pulling:false,lastWriteAt:0,errCount:0,ciclo:0,
+  base:null,lastMod:0,writing:false,pending:false,pulling:false,lastWriteAt:0,errCount:0,ciclo:0,
   clone(o){return JSON.parse(JSON.stringify(o));},
-  adotar(dados,lastMod,txt,size){db=normalizarDB(dados);DB.base=DB.clone(db);DB.lastMod=lastMod||0;DB.lastJson=txt||JSON.stringify(db);if(size!=null)DB.lastSize=size;},
-  // Grava. (v12.0) Antes de escrever, o arquivo do disco é SEMPRE lido e comparado
-  // com o que esta máquina tem. A versão anterior confiava na data do arquivo
-  // (lastModified) para decidir se alguém havia gravado — e em pasta de rede o
-  // Windows/SMB frequentemente entrega a data velha. Quando isso acontecia, esta
-  // máquina gravava o banco inteiro por cima e APAGAVA a solicitação que outro
-  // computador tinha acabado de registrar. Era por isso que pedido sumia e o
-  // histórico ficava diferente de um computador para o outro.
+  adotar(dados){db=normalizarDB(dados);DB.base=DB.clone(db);DB.lastMod=(PASTA.indice&&PASTA.indice.ts)||Date.now();},
   async push(){
     if(!db)return;
-    // NUNCA salvar local. Sem banco da rede conectado, o dado não pode ser gravado.
-    if(!dbHandle){setSync('SEM BANCO — não salvo');toast('⛔ Sem conexão com o banco da rede. O registro NÃO foi salvo. Conecte o JSON da rede.','err');return;}
+    if(!dbHandle||!PASTA.banco){setSync('SEM BANCO — não salvo');toast('⛔ Sem conexão com a pasta do banco na rede. O registro NÃO foi salvo.','err');return;}
     if(DB.writing){DB.pending=true;return;}
     DB.writing=true;setSync('Salvando…');
-    let houveMerge=false;
+    let houveMerge=false,trava=null;
     try{
       const gap=Date.now()-DB.lastWriteAt;if(gap<25)await sleep(25-gap);
-      let f=await dbHandle.getFile();
-      const txt=await f.text();                       // leitura de verdade, sem confiar na data
-      if(txt.trim()&&txt!==DB.lastJson){
-        let disk=null;
-        try{disk=JSON.parse(txt);}catch(e){disk=null;} // arquivo no meio de uma gravação alheia
-        if(disk===null){
-          // espera a outra máquina terminar e tenta de novo
-          await sleep(180);
-          f=await dbHandle.getFile();
-          const t2=await f.text();
-          try{disk=t2.trim()?JSON.parse(t2):null;}catch(e){disk=null;}
-        }
-        if(disk){const dn=normalizarDB(disk);db=mergeDB(DB.base,db,dn);_resolverReservas(DB.base,dn,db);houveMerge=true;}
+      trava=await PASTA.pegarTrava();
+      if(!trava)throw new Error('a pasta está ocupada por outro PC há mais de '+PASTA.LOCK_ESPERA/1000+'s');
+      // JÁ COM A TRAVA: alguém gravou depois da nossa última leitura?
+      for(let t=0;t<PASTA.TENTATIVAS;t++){
+        const m=await PASTA.lerMudancas();
+        if(!m)break;
+        // monta "o disco" = o que conhecíamos + o que mudou, e faz o merge de 3 vias
+        const disco=DB.clone(DB.base);
+        Object.keys(m.mudou).forEach(dom=>Object.assign(disco,JSON.parse(m.mudou[dom])));
+        disco.historico=PASTA.historicoAtual();   // inclui exclusões feitas por outro PC
+        const dn=normalizarDB(disco);
+        db=mergeDB(DB.base,db,dn);_resolverReservas(DB.base,dn,db);
+        DB.base=DB.clone(normalizarDB(PASTA.juntar(PASTA.bruto)));
+        houveMerge=true;
       }
-      DB.lastMod=f.lastModified;DB.lastSize=f.size;
-      const json=JSON.stringify(db);
-      if(json!==txt){
-        const w=await dbHandle.createWritable();await w.write(json);await w.close();
-        // Confere se a rede realmente gravou (SMB às vezes engole a escrita).
-        let gravado=false;
-        for(let tent=0;tent<2&&!gravado;tent++){
-          try{
-            const nf=await dbHandle.getFile();
-            const conf=await nf.text();
-            if(conf===json){gravado=true;DB.lastMod=nf.lastModified;DB.lastSize=nf.size;}
-            else if(tent===0){const w2=await dbHandle.createWritable();await w2.write(json);await w2.close();}
-          }catch(e){break;}
-        }
-        if(!gravado)throw new Error('A rede não confirmou a gravação.');
-        DB.lastJson=json;DB.lastWriteAt=Date.now();
-      }else{
-        DB.lastJson=json;
-      }
+      if(houveMerge)PASTA.log('merge com gravação de outro PC');
+      await PASTA.gravarTudo(db);
+      DB.lastWriteAt=Date.now();DB.lastMod=PASTA.indice.ts||Date.now();
       DB.base=DB.clone(db);DB.errCount=0;setSync('Sincronizado');_bancoAtualizarData();
       if(houveMerge)refreshView();
     }catch(e){
+      console.warn('[gravar]',e);
+      if(e.conflito){PASTA.log('conflito: '+e.message);DB.pending=true;setSync('Conflito — refazendo…');return;}
       DB.errCount++;setSync('Erro ao salvar');
-      if(DB.errCount===3)toast('⚠️ O banco da rede não está aceitando a gravação. Avise o MMT antes de continuar.','err');
+      if(DB.errCount===3)toast('⚠️ O banco da rede não está aceitando a gravação ('+e.message+'). Avise o MMT antes de continuar.','err');
       const d=Math.min(150*Math.pow(2,DB.errCount-1),4000);
       DB.pending=true;setTimeout(()=>{if(DB.pending){DB.pending=false;DB.push();}},d);
     }finally{
+      if(trava)await PASTA.soltarTrava(trava);
       DB.writing=false;
-      if(DB.pending){DB.pending=false;setTimeout(()=>DB.push(),60);}
+      // pending só é limpo quando a nova gravação COMEÇA. Antes era limpo aqui,
+      // e nesses 60ms o sync de 2s podia ler a rede por cima da alteração ainda
+      // não gravada e apagá-la (pedido sumia sem erro nenhum).
+      if(DB.pending)setTimeout(()=>{if(DB.pending&&!DB.writing){DB.pending=false;DB.push();}},60);
     }
   },
-  // Lê do disco se o arquivo mudou. (v12.0) Em pasta de rede a data e o tamanho
-  // do arquivo não são confiáveis, então de tempos em tempos o conteúdo é lido
-  // por inteiro. Quando a janela está minimizada/em segundo plano, a leitura é
-  // espaçada — é o que deixava o sistema pesado em computador fraco.
+  // Lê só o índice (~1KB). Se algum arquivo mudou, lê só ele.
   async pull(forcar){
-    if(!dbHandle||DB.writing||DB.pending||DB.pulling)return false;
+    if(!dbHandle||!PASTA.banco||DB.writing||DB.pending||DB.pulling)return false;
     if(!forcar&&document.hidden&&(DB.ciclo%15!==0)){DB.ciclo++;return false;}
     DB.pulling=true;
     try{
-      const f=await dbHandle.getFile();
       DB.ciclo++;
-      const mudouData=(f.lastModified!==DB.lastMod);
-      const mudouTam=(DB.lastSize>=0&&f.size!==DB.lastSize);
-      const conferenciaCompleta=forcar||(DB.ciclo%3===0);
-      if(!mudouData&&!mudouTam&&!conferenciaCompleta)return false;
-      const txt=await f.text();if(!txt.trim())return false;
-      if(txt===DB.lastJson){DB.lastMod=f.lastModified;DB.lastSize=f.size;return false;} // igual ao que já está na tela
-      let nd;try{nd=JSON.parse(txt);}catch(e){return false;} // arquivo no meio de uma gravação — tenta no próximo ciclo
-      if(DB.writing||DB.pending)return false;
-      DB.adotar(nd,f.lastModified,txt,f.size);_bancoAtualizarData();
+      if(forcar||DB.ciclo%15===0)PASTA.indiceTxt='';   // de tempos em tempos confere tudo (SMB atrasa)
+      const m=await PASTA.lerMudancas();
+      if(!m)return false;
+      if(DB.writing||DB.pending)return false;          // a gravação fará o merge
+      DB.adotar(PASTA.juntar(PASTA.bruto));_bancoAtualizarData();
       setSync('Atualizado');refreshView();return true;
     }catch(e){setSync('Erro ao ler');return false;}finally{DB.pulling=false;}
   },
-  // Garante banco fresco antes de uma operação crítica (requisição, correção, limpeza)
-  // (v12.3) também espera uma leitura em andamento terminar — antes, se o ciclo de 2s
-  // estivesse lendo, pull() voltava sem ler nada e a requisição usava o banco velho.
   async pullNow(){for(let i=0;i<40&&(DB.writing||DB.pending||DB.pulling);i++)await sleep(50);await DB.pull(true);}
 };
 
@@ -1782,34 +2031,65 @@ function _infoBancoAtivo(){
   el.textContent=(db._registro?'🛡️ '+db._registro.id+' · ':'')+db.usuarios.length+' usuários · '+db.historico.length+' requisições';
 }
 
-async function _concluirConexao(fh,silencioso){
-  const file=await fh.getFile();const t=await file.text();let dados;
-  try{dados=t.trim()?JSON.parse(t):null;}catch(err){toast('Erro ao ler o JSON.','err');return false;}
-  if(!dados){toast('Arquivo vazio: não é o banco do Sistema de Solda.','err');return false;}
+// ═══ CONEXÃO COM A PASTA DO SISTEMA (v13.0) ═══
+// A autorização é pedida UMA vez, para a pasta. O handle fica guardado no
+// IndexedDB, então nas próximas aberturas a reconexão é automática.
+async function _permissaoPasta(dh,pedir){
+  let p=await dh.queryPermission({mode:'readwrite'});
+  if(p!=='granted'&&pedir)p=await dh.requestPermission({mode:'readwrite'});
+  return p==='granted';
+}
+async function _concluirConexao(dh,silencioso){
+  const conf=await PASTA.ehPastaDoSistema(dh);
+  if(!conf){
+    if(silencioso)return false;
+    return await _oferecerMigracao(dh);
+  }
+  let dados;
+  try{await PASTA.abrirHandles(dh,false);dados=await PASTA.carregar();}
+  catch(e){PASTA.zerar();toast('❌ Não consegui abrir o banco da pasta "'+dh.name+'": '+e.message,'err');return false;}
   const erro=_validarEstruturaBanco(dados);
-  if(erro){toast('❌ Arquivo recusado: '+erro,'err');return false;}
-  // Reconexão automática só é silenciosa se o arquivo já está assinado
-  const _lb=_bancoLembrado();
-  const _reconhecido=dados._registro&&_lb&&_lb.id===dados._registro.id&&!(_lb.lastMod&&file.lastModified<_lb.lastMod-60000);
-  // v10.7: sem janela — só mensagem e segue normal
+  if(erro){PASTA.zerar();toast('❌ Banco recusado: '+erro,'err');return false;}
+  const _lb=_bancoLembrado(),ts=PASTA.indice.ts||0;
   if(dados._registro&&_lb&&_lb.id&&_lb.id!==dados._registro.id)toast('⚠️ Atenção: banco diferente do último usado neste computador.','warn');
-  else if(dados._registro&&_lb&&_lb.id===dados._registro.id&&_lb.lastMod&&file.lastModified<_lb.lastMod-60000)toast('⚠️ Atenção: arquivo mais antigo que o último usado (pode ser cópia).','warn');
-  else toast('✅ Arquivo correto','ok');
-  const precisaAssinar=dados._sistema!==ASSINATURA_BANCO||!dados._registro;
-  dbHandle=fh;DB.adotar(dados,file.lastModified,t,file.size);_handleGuardar(fh);_reconectarUI(false);
-  if(precisaAssinar){db._sistema=ASSINATURA_BANCO;if(!db._registro)db._registro=_novoRegistro();DB.push();}
-  _bancoGuardar(db._registro&&db._registro.id,file.lastModified);
-  dbLoaded(fh.name);return true;
+  else if(!silencioso)toast('✅ Pasta do sistema reconhecida','ok');
+  dbHandle=dh;DB.adotar(dados);_handleGuardar(dh);_reconectarUI(false);
+  _bancoGuardar(db._registro&&db._registro.id,ts);
+  PASTA.limparLogsVelhos();
+  dbLoaded(dh.name+' · '+PASTA.pcId());return true;
+}
+// Pasta sem SOLDA_PASTA_DO_SISTEMA.json: pode ser a pasta errada, ou a 1ª vez no formato novo.
+async function _oferecerMigracao(dh){
+  let temDados=false;try{await dh.getDirectoryHandle('dados');temDados=true;}catch(e){}
+  if(temDados){toast('❌ A pasta "'+dh.name+'" tem uma pasta "dados" mas não tem o '+PASTA.CONFIRMACAO+'. Não é a pasta do Sistema de Solda (ou o arquivo de confirmação foi apagado). Fale com o MMT.','err');return false;}
+  if(!confirm('A pasta "'+dh.name+'" ainda não tem o banco no formato novo (v13).\n\n'+
+    'Para CONVERTER, selecione em seguida o JSON antigo do banco (BANCO_SOLDA...json).\n'+
+    'O JSON antigo NÃO é apagado: uma cópia fica em dados/banco/bak/.\n\n'+
+    'ANTES DE CONTINUAR: feche o sistema em TODOS os outros computadores.\n\nContinuar?'))return false;
+  let fh;
+  try{[fh]=await window.showOpenFilePicker({types:[{description:'JSON',accept:{'application/json':['.json']}}],multiple:false});}
+  catch(e){return false;}
+  const f=await fh.getFile(),t=await f.text();let d;
+  try{d=JSON.parse(t);}catch(e){toast('Erro ao ler o JSON antigo.','err');return false;}
+  const er=_validarEstruturaBanco(d);if(er){toast('❌ JSON recusado: '+er,'err');return false;}
+  d=normalizarDB(d);
+  if(!d._sistema)d._sistema=ASSINATURA_BANCO;if(!d._registro)d._registro=_novoRegistro();
+  let n;
+  try{n=await PASTA.criar(dh,d,t,f.name);}
+  catch(e){PASTA.zerar();toast('❌ Conversão interrompida: '+e.message,'err');return false;}
+  PASTA.zerar();
+  toast('✅ Banco convertido: '+n+' registro(s) de histórico, '+(d.solicitacoes||[]).length+' solicitação(ões). O JSON antigo não será mais usado.','ok');
+  return await _concluirConexao(dh);
 }
 
-// ═══ DESCONECTAR / TROCAR DE BANCO (v10.7) ═══
+// ═══ DESCONECTAR / TROCAR DE PASTA ═══
 async function desconectarBanco(){
-  if(!confirm('Desconectar do banco atual?\n\nVocê voltará para a tela de login e poderá conectar em outro arquivo JSON.'))return;
-  for(let i=0;i<60&&(DB.writing||DB.pending);i++)await sleep(50); // termina gravação em andamento
+  if(!confirm('Desconectar do banco atual?\n\nVocê voltará para a tela de login e poderá conectar outra pasta.'))return;
+  for(let i=0;i<60&&(DB.writing||DB.pending);i++)await sleep(50);
   if(cu)doLogout();
   clearInterval(_syncInt);_syncInt=null;
   await _handleEsquecer();
-  dbHandle=null;db=null;DB.base=null;DB.lastMod=0;DB.lastJson='';DB.errCount=0;
+  dbHandle=null;db=null;DB.base=null;DB.lastMod=0;DB.errCount=0;PASTA.zerar();
   const up=document.getElementById('db-upload-container');if(up)up.style.display='block';
   const am=document.getElementById('db-active-msg');if(am)am.style.display='none';
   const lf=document.getElementById('login-fields');if(lf){lf.style.opacity='0.35';lf.style.pointerEvents='none';}
@@ -1817,36 +2097,29 @@ async function desconectarBanco(){
   const er=document.getElementById('login-err');if(er)er.style.display='none';
   _reconectarUI(false);
   document.getElementById('login-screen').style.display='flex';
-  toast('Banco desconectado. Selecione o novo arquivo JSON.','ok');
+  toast('Banco desconectado. Selecione a pasta do sistema.','ok');
 }
 async function reconectarBanco(){
-  const fh=await _handleLembrado();
-  if(!fh){_reconectarUI(false);toast('Nenhum arquivo lembrado. Selecione o JSON.','err');return;}
-  try{
-    let p=await fh.queryPermission({mode:'readwrite'});
-    if(p!=='granted')p=await fh.requestPermission({mode:'readwrite'});
-    if(p!=='granted')return;
-    await _concluirConexao(fh);
-  }catch(e){await _handleEsquecer();_reconectarUI(false);toast('Não foi possível reconectar. Selecione o JSON.','err');}
+  const dh=await _handleLembrado();
+  if(!dh||dh.kind!=='directory'){await _handleEsquecer();_reconectarUI(false);toast('Nenhuma pasta lembrada. Selecione a pasta do sistema.','err');return;}
+  try{if(!await _permissaoPasta(dh,true))return;await _concluirConexao(dh);}
+  catch(e){await _handleEsquecer();_reconectarUI(false);toast('Não foi possível reconectar. Selecione a pasta do sistema.','err');}
 }
 async function _tentarReconexaoAutomatica(){
-  if(!window.showOpenFilePicker||!window.indexedDB)return;
-  const fh=await _handleLembrado();
-  if(!fh)return;
-  try{const p=await fh.queryPermission({mode:'readwrite'});if(p==='granted'&&await _concluirConexao(fh,true))return;}catch(e){}
+  if(!window.showDirectoryPicker||!window.indexedDB)return;
+  const dh=await _handleLembrado();
+  if(!dh)return;
+  if(dh.kind!=='directory'){await _handleEsquecer();return;}   // era o arquivo JSON da v12
+  try{if(await _permissaoPasta(dh,false)&&await _concluirConexao(dh,true))return;}catch(e){}
   _reconectarUI(true);
 }
-
 async function selectDB(){
-  if(!window.showOpenFilePicker){
-    const inp=document.createElement('input');inp.type='file';inp.accept='.json';
-    inp.onchange=async e=>{const f=e.target.files[0];if(!f)return;const t=await f.text();let d;try{d=JSON.parse(t);}catch{toast('Erro ao ler o JSON.','err');return;}const er=_validarEstruturaBanco(d);if(er){toast('❌ Arquivo recusado: '+er,'err');return;}toast('✅ Arquivo correto','ok');DB.adotar(d,0,t);dbLoaded(f.name);};inp.click();return;
-  }
+  if(!window.showDirectoryPicker){toast('Use o Google Chrome ou o Microsoft Edge para conectar a pasta da rede.','err');return;}
   try{
-    const[fh]=await window.showOpenFilePicker({types:[{description:'JSON',accept:{'application/json':['.json']}}],multiple:false});
-    const p=await fh.queryPermission({mode:'readwrite'});if(p!=='granted')await fh.requestPermission({mode:'readwrite'});
-    await _concluirConexao(fh);
-  }catch(e){if(e.name!=='AbortError')toast('Erro ao abrir arquivo.','err');}
+    const dh=await window.showDirectoryPicker({id:'tpv-solda-pasta',mode:'readwrite'});
+    if(!await _permissaoPasta(dh,true)){toast('Sem permissão de gravação na pasta.','err');return;}
+    await _concluirConexao(dh);
+  }catch(e){if(e.name!=='AbortError')toast('Erro ao abrir a pasta: '+e.message,'err');}
 }
 
 function dbLoaded(name){
@@ -3609,7 +3882,7 @@ function renderCfg(){
   </tr>`).join('');
 
   document.getElementById('cfg-linhas').innerHTML=db.linhas.map((l,i)=>`<div class="chip">${l}<button class="chip-del" onclick="delLn(${i})">✕</button></div>`).join('')||'<p class="muted">Nenhuma linha.</p>';
-  document.getElementById('cfg-db-info').textContent='Arquivo: '+(dbHandle?dbHandle.name:'banco_local.json')+' · Sistema '+VERSAO+' · ID do banco: '+((db&&db._registro)?db._registro.id:'—')+' · gravação com merge multiusuário';
+  document.getElementById('cfg-db-info').textContent='Pasta: '+(dbHandle?dbHandle.name+' (dados/banco) · Este PC: '+PASTA.pcId():'—')+' · Sistema '+VERSAO+' · ID do banco: '+((db&&db._registro)?db._registro.id:'—')+' · gravação com merge multiusuário';
 }
 
 let _editModIdx=null;

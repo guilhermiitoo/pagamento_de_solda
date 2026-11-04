@@ -3,7 +3,7 @@
 //  3. quanto tempo leva para abrir     4. que o leitor de planilha liga sob demanda
 const {chromium}=require('playwright');
 const RAIZ=require('path').join(__dirname,'..');
-const ARQ=process.argv[2]||RAIZ+'/TPV_SolderControl_v11_0.html';
+const ARQ=process.argv[2]||RAIZ+'/TPV_SolderControl_v13_0.html';
 
 (async()=>{
   const b=await chromium.launch({...(process.env.CHROME?{executablePath:process.env.CHROME}:{})});
