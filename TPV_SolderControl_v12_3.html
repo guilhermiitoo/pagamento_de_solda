@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>TPV – Controle de Pagamento de Solda v12.0</title>
+<title>TPV – Controle de Pagamento de Solda v12.3</title>
 <!-- v12.0: 100% OFFLINE. Nenhum recurso é buscado na internet.
      A política abaixo bloqueia qualquer tentativa de acesso externo (http/https),
      mesmo que algum trecho futuro tente. Fonte, gráficos e leitor de planilha
@@ -895,6 +895,7 @@ textarea.fc{resize:vertical;min-height:75px;}
         </div>
         <div class="card mb20">
           <div class="ch"><div class="ct"><span class="ci">⏳</span>Aguardando entrega</div></div>
+          <div id="sol-lote"></div>
           <div id="sol-pend"></div>
         </div>
         <div class="card">
@@ -1257,6 +1258,23 @@ textarea.fc{resize:vertical;min-height:75px;}
   </div>
 </div>
 
+<!-- MODAL EDITAR LÍDER / LINHA DO HISTÓRICO (v12.2 · só admin/MMT) -->
+<div id="m-edit-hist" class="mbg" style="display:none;">
+  <div class="mb" style="max-width:500px;">
+    <div class="mt2">✏️ Corrigir quem solicitou</div>
+    <div id="eh-info" style="font-size:12px;color:#22394f;background:#f4f6f9;border:1.5px solid #d0d8e4;border-radius:8px;padding:10px 12px;margin-bottom:14px;line-height:1.6;"></div>
+    <div class="ff mb16"><label>Líder (quem realmente solicitou)</label>
+      <input class="fc" id="eh-lider" list="eh-lider-lista" placeholder="Digite ou escolha o nome">
+      <datalist id="eh-lider-lista"></datalist></div>
+    <div class="ff mb16"><label>Linha</label><select class="fc" id="eh-linha"></select></div>
+    <div class="ff mb16"><label>Motivo <span class="muted">(opcional)</span></label>
+      <input class="fc" id="eh-motivo" maxlength="120" placeholder="Ex.: líder da SMT 03 pediu pelo login da SMT 05"></div>
+    <div id="eh-vinc" class="muted" style="font-size:11px;margin-bottom:6px;"></div>
+    <div id="eh-err" style="color:#c0392b;font-size:12px;font-weight:700;margin-bottom:10px;display:none;"></div>
+    <div class="ma"><button class="btn bo2" onclick="closeM('m-edit-hist')">Cancelar</button><button class="btn bs" id="eh-save-btn" onclick="salvarEditHist()">✅ Salvar correção</button></div>
+  </div>
+</div>
+
 <!-- MODAL USUÁRIO -->
 <div id="m-usr" class="mbg" style="display:none;">
   <div class="mb" style="max-width:540px;">
@@ -1456,8 +1474,21 @@ textarea.fc{resize:vertical;min-height:75px;}
        bloqueia qualquer acesso externo.
      - Ícone próprio do sistema e botão "Criar atalho na Área de Trabalho".
      - Leitura do banco espaçada quando a janela está em segundo plano (computador fraco).
+   v12.2 (22/09/2026) — autor: Guilherme da Costa Fernandes
+     - Solicitação da Produção: ACEITE EM LOTE (só login admin/MMT). Caixinha de seleção em
+       cada pedido + "Selecionar todos" + botão "Aceitar selecionados". Feito para a limpeza
+       inicial dos pedidos parados. Tubo reservado que ainda está no estoque sai normalmente
+       (vai para o Histórico e para "em uso" da linha); tubo que não está mais no estoque e
+       pedido antigo sem reserva são só encerrados como ENTREGUE, sem mexer no estoque.
+       Antes de aplicar, o sistema mostra o resumo do que vai acontecer.
+     - Histórico de Requisições: botão "✏️ Editar" (só login admin/MMT) para corrigir o
+       LÍDER e a LINHA de um registro (quando um líder pede para outro). A correção vale
+       também para o registro vinculado do mesmo tubo (Solicitação ↔ Saída) e para a lista
+       de soldas em uso da linha. Toda edição fica gravada (quem, quando, antes/depois e
+       motivo) e o registro ganha o ícone ✏️ com essas informações.
+     - Etiqueta e regras de pagamento existentes: sem alteração.
    ═══════════════════════════════════════════════════════════════ */
-const VERSAO='v12.0';
+const VERSAO='v12.2';
 
 // ═══ DATABASE ═══
 let dbHandle=null, db=null, cu=null, _syncInt=null, _clockInt=null, _tab='';
@@ -1545,7 +1576,7 @@ const DB={
           const t2=await f.text();
           try{disk=t2.trim()?JSON.parse(t2):null;}catch(e){disk=null;}
         }
-        if(disk){db=mergeDB(DB.base,db,normalizarDB(disk));houveMerge=true;}
+        if(disk){const dn=normalizarDB(disk);db=mergeDB(DB.base,db,dn);_resolverReservas(DB.base,dn,db);houveMerge=true;}
       }
       DB.lastMod=f.lastModified;DB.lastSize=f.size;
       const json=JSON.stringify(db);
@@ -1644,6 +1675,51 @@ function mergeDB(base,local,disk){
   if(local._sistema||disk._sistema)r._sistema=local._sistema||disk._sistema; // mantém assinatura do banco
   if(local._registro||disk._registro)r._registro=disk._registro||local._registro; // mantém registro de identidade
   return r;
+}
+
+// ── (v12.3) TRAVA DE RESERVA DUPLICADA ──
+// Duas líderes solicitando ao mesmo tempo (ou uma máquina com leitura velha da rede)
+// reservavam o MESMO tubo, e o merge juntava as duas solicitações. Agora, depois do
+// merge, toda solicitação NOVA desta máquina é conferida contra o que já está no disco:
+// quem gravou primeiro fica com o tubo; a segunda recebe o próximo tubo livre da fila
+// ou, se não houver, é cancelada automaticamente com aviso.
+let _avisosReserva=[];
+function _resolverReservas(base,disk,r){
+  const ant=new Set([...(base&&base.solicitacoes||[]),...(disk.solicitacoes||[])].map(x=>x.id));
+  const novas=(r.solicitacoes||[]).filter(x=>!ant.has(x.id)&&x.status==='PENDENTE');
+  if(!novas.length)return;
+  const ocupados=new Set();
+  (r.solicitacoes||[]).forEach(x=>{if(!ant.has(x.id))return;
+    if(x.status==='PENDENTE')(x.reservados||[]).forEach(t=>ocupados.add(t.lpn));
+    if(x.status==='ENTREGUE')(x.lpns||[]).forEach(l=>ocupados.add(l));});
+  Object.values(r.emUso||{}).forEach(l=>(l||[]).forEach(t=>ocupados.add(t.lpn)));
+  novas.sort((a,b)=>(a.ts||0)-(b.ts||0)).forEach(sol=>{
+    const fila=(r.estoque&&r.estoque[sol.modelo])||[];
+    const naFila=new Set(fila.map(t=>t.lpn));
+    const trocas=[];let falta=false;
+    sol.reservados=(sol.reservados||[]).map(t=>{
+      if(!ocupados.has(t.lpn)&&naFila.has(t.lpn)){ocupados.add(t.lpn);return t;}
+      const livre=fila.find(it=>!ocupados.has(it.lpn));
+      if(!livre){falta=true;return null;}
+      ocupados.add(livre.lpn);const nt={lpn:livre.lpn,fifo:livre.fifo!=null?livre.fifo:null};
+      trocas.push([t.lpn,nt]);return nt;
+    }).filter(Boolean);
+    trocas.forEach(([velho,nt])=>(r.historico||[]).forEach(h=>{
+      if(h.solicitacaoId===sol.id&&h.tipo==='SOLICITACAO'&&h.lpn===velho){h.lpn=nt.lpn;h.fifo=nt.fifo;h.tubo=nt.fifo!=null?nt.fifo:'–';}}));
+    if(falta){
+      const fic=new Set(sol.reservados.map(t=>t.lpn));
+      r.historico=(r.historico||[]).filter(h=>!(h.solicitacaoId===sol.id&&h.tipo==='SOLICITACAO'&&!fic.has(h.lpn)));
+      sol.qty=sol.reservados.length;
+      if(!sol.qty){sol.status='CANCELADA';sol.motivo='Tubo já reservado por outra solicitação no mesmo instante';}
+    }
+    if(trocas.length||falta)_avisosReserva.push({sol,trocas,falta});
+  });
+}
+function _mostrarAvisosReserva(){
+  _avisosReserva.splice(0).forEach(a=>{
+    if(a.sol.status==='CANCELADA')toast('⛔ Outra líder reservou o último tubo de '+a.sol.modelo+' no mesmo instante. Sua solicitação foi CANCELADA — fale com o MMT.','err');
+    else toast('⚠️ Tubo já reservado por outra líder no mesmo instante. Sua reserva foi trocada para: '+a.sol.reservados.map(t=>'#'+(t.fifo!=null?t.fifo:'–')).join(', ')+(a.falta?' (quantidade reduzida para '+a.sol.qty+')':''),'warn');
+  });
 }
 
 // ═══ RECONEXÃO AUTOMÁTICA DE BANCO (IndexedDB) ═══
@@ -2126,7 +2202,7 @@ function renderDashTable(){
     <td style="font-size:11px;color:#344963;">${r.qtdKit||'–'}</td>
     <td style="font-size:11px;color:#344963;">${r.invoice||'–'}</td>
     <td style="font-size:11px;color:#344963;">${r.pullList||'–'}</td>
-    <td><span class="badge ${r.tipo==='DEVOLUCAO'||r.tipo==='DEVOLUCAO_FORCADA'?'bo':r.tipo==='SAIDA'?'bg':'bg'}">${r.tipo==='DEVOLUCAO'?'↩ Dev.':r.tipo==='DEVOLUCAO_FORCADA'?'↩ Forçada':'↗ Saída'}</span></td>
+    <td><span class="badge ${r.tipo==='DEVOLUCAO'||r.tipo==='DEVOLUCAO_FORCADA'?'bo':r.tipo==='SOLICITACAO'?'bgr':'bg'}">${r.tipo==='DEVOLUCAO'?'↩ Dev.':r.tipo==='DEVOLUCAO_FORCADA'?'↩ Forçada':r.tipo==='SOLICITACAO'?'🕐 Solicitação':'↗ Saída'}</span></td>
   </tr>`).join('');
   renderDashReqPagination(total,totalPages);
 }
@@ -2231,7 +2307,7 @@ function expXLSXDash(){
   const data=getDashFiltered();
   if(!data.length){toast('Nenhum dado para exportar.','warn');return;}
   const headers=['#','Nº FIFO','LPN','LINHA','LÍDER','DATA','HORA','OP','MODELO','CHASSI','QTD KIT','INVOICE','PULL LIST','TIPO'];
-  const rows=data.map((r,i)=>[db.historico.length-i,r.tubo!=null?r.tubo:'',r.lpn||'',r.linha||'',r.lider||'',r.data||'',r.hora||'',r.op||'',r.modelo||'',r.chassi||'',r.qtdKit||'',r.invoice||'',r.pullList||'',r.tipo==='DEVOLUCAO'?'Devolução':r.tipo==='DEVOLUCAO_FORCADA'?'Dev. Forçada':'Saída']);
+  const rows=data.map((r,i)=>[db.historico.length-i,r.tubo!=null?r.tubo:'',r.lpn||'',r.linha||'',r.lider||'',r.data||'',r.hora||'',r.op||'',r.modelo||'',r.chassi||'',r.qtdKit||'',r.invoice||'',r.pullList||'',r.tipo==='DEVOLUCAO'?'Devolução':r.tipo==='DEVOLUCAO_FORCADA'?'Dev. Forçada':r.tipo==='SOLICITACAO'?'Solicitação':'Saída']);
   const wsData=[headers,...rows];
   const ws=XLSX.utils.aoa_to_sheet(wsData);
   // Negrito no cabeçalho
@@ -2574,7 +2650,7 @@ function onRqChange(){
   const previewBox=document.getElementById('rq-preview-box');
 
   if(!mod||!ln){area.style.display='none';return;}
-  const fila=db.estoque[mod]||[];
+  const fila=filaLivre(mod);
   if(!fila.length){
     area.style.display='block';
     document.getElementById('rq-quota-msg').style.display='none';
@@ -2620,7 +2696,7 @@ function renderRqFIFO(){
   if(!modVal){if(card)card.style.display='none';c.innerHTML='';return;}
   if(card)card.style.display='block';
 
-  const items=db.estoque[modVal]||[];
+  const items=filaLivre(modVal);
   const modeloInfo=db.modelos.find(m=>m.prefixo===modVal);
   const desc=modeloInfo?modeloInfo.descricao:'';
   const total=items.length;
@@ -2658,6 +2734,24 @@ function renderRqFIFO(){
   c.innerHTML=html;
 }
 
+// ═══ RESERVA FIFO (v11.5) ═══
+// Quando o operador solicita, os tubos já ficam RESERVADOS para ele.
+// O MMT só pode entregar exatamente esses tubos — nunca outros.
+function lpnsReservados(exceto){
+  const set=new Set();
+  (db.solicitacoes||[]).forEach(x=>{
+    if(x.status!=='PENDENTE')return;
+    if(exceto&&x.id===exceto)return;
+    (x.reservados||[]).forEach(r=>set.add(r.lpn));
+  });
+  return set;
+}
+// Fila do modelo já sem os tubos prometidos a outras solicitações pendentes
+function filaLivre(modelo,exceto){
+  const res=lpnsReservados(exceto);
+  return (db.estoque[modelo]||[]).filter(it=>!res.has(it.lpn));
+}
+
 async function confirmarReq(){
   if(_reqBusy)return;
   const mod=document.getElementById('rq-mod').value;
@@ -2679,14 +2773,32 @@ async function confirmarReq(){
   try{
     await DB.pullNow();
     if(!db.solicitacoes)db.solicitacoes=[];
-    const fila=db.estoque[mod]||[];
-    if(!fila.length)toast('Atenção: no momento não há estoque de '+mod+'. A solicitação foi registrada mesmo assim.','warn');
+    if(!db.historico)db.historico=[];
+    // Reserva FIFO: pega os primeiros tubos da fila que ainda não foram prometidos a ninguém
+    const livres=filaLivre(mod);
+    if(!livres.length){
+      toast('Não há tubo de '+mod+' livre para reservar no momento (todos já estão reservados para outras solicitações). Fale com o MMT.','err');
+      return;
+    }
+    const qtyReal=Math.min(qty,livres.length);
+    if(qtyReal<qty)toast('Só havia '+qtyReal+' tubo(s) de '+mod+' livre(s). A solicitação foi registrada com '+qtyReal+'.','warn');
+    const reservados=livres.slice(0,qtyReal).map(it=>({lpn:it.lpn,fifo:it.fifo!=null?it.fifo:null}));
     const ag=agora();
-    db.solicitacoes.push({id:novoId('s'),ts:ag.ts,data:ag.data,hora:ag.hora,status:'PENDENTE',
-      lider:cu.nome,loginLider:cu.login,linha:ln,op,modelo:mod,qty,
-      chassi,qtdKit,invoice,pullList,planoModelo});
+    const solId=novoId('s');
+    db.solicitacoes.push({id:solId,ts:ag.ts,data:ag.data,hora:ag.hora,status:'PENDENTE',
+      lider:cu.nome,loginLider:cu.login,linha:ln,op,modelo:mod,qty:qtyReal,
+      chassi,qtdKit,invoice,pullList,planoModelo,reservados});
+    // Grava também no Histórico (tipo SOLICITACAO) — não movimenta estoque, é só rastreio
+    reservados.forEach(r=>{
+      db.historico.push({id:novoId(),ts:ag.ts,tubo:r.fifo!=null?r.fifo:'–',lpn:r.lpn,linha:ln,
+        lider:cu.nome,loginLider:cu.login,data:ag.data,hora:ag.hora,op,modelo:mod,tipo:'SOLICITACAO',
+        chassi,qtdKit,invoice,pullList,fifo:r.fifo,solicitacaoId:solId});
+    });
     await save();
-    toast('Solicitação enviada ao MMT. Retire a solda no balcão — o MMT confirma a entrega no sistema.','ok');
+    const solFinal=(db.solicitacoes||[]).find(x=>x.id===solId);
+    const avisou=_avisosReserva.some(a=>a.sol.id===solId);_mostrarAvisosReserva();
+    if(solFinal&&solFinal.status==='CANCELADA'){renderQuotaBar();renderMinhasSolic();onRqChange();renderRqFIFO();return;}
+    if(!avisou)toast('Solicitação enviada ao MMT. Tubo(s) reservado(s): '+(solFinal?solFinal.reservados:reservados).map(r=>'#'+(r.fifo!=null?r.fifo:'–')).join(', ')+'. Retire no balcão.','ok');
     ['rq-op2','rq-plano-modelo','rq-chassi','rq-qtdkit','rq-invoice','rq-pulllist'].forEach(id=>document.getElementById(id).value='');
     document.getElementById('rq-linha').value='';
     document.getElementById('rq-linha-display').value='';
@@ -2718,21 +2830,43 @@ function renderSolic(){
   const cx=document.getElementById('sol-pend');if(!cx)return;
   const pend=solicPendentes();
   // não redesenha enquanto o MMT escolhe os tubos, a não ser que a lista mude de verdade
-  const hash=pend.map(x=>x.id).join('|')+'#'+Object.keys(db.estoque||{}).map(k=>k+':'+(db.estoque[k]||[]).length).join(',');
+  const hash=pend.map(x=>x.id+':'+((x.reservados||[]).map(r=>r.lpn).join('-'))).join('|')+'#'+Object.keys(db.estoque||{}).map(k=>k+':'+(db.estoque[k]||[]).length).join(',');
   if(hash!==_solicHash){
     _solicHash=hash;
     cx.innerHTML=pend.length?pend.map((x,idx)=>{
       const fila=db.estoque[x.modelo]||[];
-      const opts=fila.map((it,i)=>`<option value="${esc(it.lpn)}">${i+1}º da fila · FIFO #${it.fifo!=null?it.fifo:'–'} · ${esc(it.lpn)}</option>`).join('');
-      let slots='';
-      for(let k=0;k<(x.qty||1);k++){
-        slots+=`<div class="ff" style="margin-bottom:6px;"><label>Tubo ${k+1} que está sendo entregue</label>
-          <select class="fc" id="sol-pick-${x.id}-${k}" ${fila.length?'':'disabled'}>
-            ${fila.length?opts:'<option value="">— sem estoque de '+esc(x.modelo)+' —</option>'}
-          </select></div>`;
+      const res=x.reservados||[];
+      let slots='', podeEntregar;
+      if(res.length){
+        // v11.5 — tubo já reservado no ato da solicitação: o MMT NÃO escolhe, só confere e entrega
+        const faltando=res.filter(r=>!fila.find(it=>it.lpn===r.lpn));
+        podeEntregar=faltando.length===0;
+        slots=`<div style="background:#eef6ff;border:1.5px solid #b9d6ef;border-radius:8px;padding:10px 12px;">
+          <div style="font-size:10px;font-weight:800;color:#1e6fa8;text-transform:uppercase;letter-spacing:0.8px;margin-bottom:6px;">🔒 Tubo(s) reservado(s) para este pedido — entregue exatamente estes</div>
+          ${res.map((r,k)=>{
+            const ok=!!fila.find(it=>it.lpn===r.lpn);
+            return `<div style="display:flex;align-items:center;gap:8px;font-size:12px;color:#0d1b2e;padding:3px 0;">
+              <span style="background:${ok?'#1e6fa8':'#c0392b'};color:#fff;border-radius:6px;padding:2px 8px;font-weight:800;font-size:11px;">FIFO #${r.fifo!=null?r.fifo:'–'}</span>
+              <span style="font-family:monospace;font-weight:700;">${esc(r.lpn)}</span>
+              ${ok?'':'<span style="color:#c0392b;font-weight:700;font-size:11px;">⚠ não está mais no estoque</span>'}
+            </div>`;
+          }).join('')}
+        </div>`;
+        if(!podeEntregar)slots+=`<div style="margin-top:6px;font-size:11px;color:#c0392b;font-weight:700;">Cancele o pedido e peça para o operador solicitar novamente.</div>`;
+      }else{
+        // Pedidos antigos (sem reserva) continuam com a escolha manual
+        const opts=fila.map((it,i)=>`<option value="${esc(it.lpn)}">${i+1}º da fila · FIFO #${it.fifo!=null?it.fifo:'–'} · ${esc(it.lpn)}</option>`).join('');
+        podeEntregar=fila.length>0;
+        for(let k=0;k<(x.qty||1);k++){
+          slots+=`<div class="ff" style="margin-bottom:6px;"><label>Tubo ${k+1} que está sendo entregue <span class="muted">(pedido antigo, sem reserva)</span></label>
+            <select class="fc" id="sol-pick-${x.id}-${k}" ${fila.length?'':'disabled'}>
+              ${fila.length?opts:'<option value="">— sem estoque de '+esc(x.modelo)+' —</option>'}
+            </select></div>`;
+        }
       }
       return `<div style="border:2px solid ${idx===0?'#1e6fa8':'#e3e9f0'};border-radius:10px;padding:14px 16px;margin-bottom:12px;background:${idx===0?'#f8faff':'#fff'};">
         <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:8px;">
+          ${solicEhAdmin()?`<label style="display:inline-flex;align-items:center;gap:5px;cursor:pointer;font-size:11px;font-weight:700;color:#344963;"><input type="checkbox" class="sol-chk" data-id="${esc(x.id)}" ${_solicSel.has(x.id)?'checked':''} onchange="solicMarcar('${x.id}',this.checked)" style="width:16px;height:16px;cursor:pointer;">Selecionar</label>`:''}
           <span style="background:${idx===0?'#1e6fa8':'#7a8fa6'};color:#fff;border-radius:6px;padding:3px 10px;font-size:11px;font-weight:800;">${idx+1}ª na fila de pedidos</span>
           <b style="color:#0d1b2e;">${esc(x.lider)}</b>
           <span class="muted">${esc(x.linha)} · OP ${esc(x.op)} · ${esc(x.modelo)} · ${x.qty} tubo(s)</span>
@@ -2741,12 +2875,13 @@ function renderSolic(){
         </div>
         ${slots}
         <div style="display:flex;gap:8px;margin-top:8px;">
-          <button class="btn bs" style="flex:1;" onclick="entregarSolic('${x.id}')" ${fila.length?'':'disabled'}>✅ Entregue</button>
+          <button class="btn bs" style="flex:1;" onclick="entregarSolic('${x.id}')" ${podeEntregar?'':'disabled'}>✅ Entregue</button>
           <button class="btn bd btn-sm" onclick="cancelarSolic('${x.id}')">✖ Cancelar pedido</button>
         </div>
       </div>`;
     }).join(''):'<div class="es" style="padding:24px;"><div class="es-ic">✅</div><p>Nenhuma solicitação aguardando entrega.</p></div>';
   }
+  renderSolicLote(pend);
   const hist=(db.solicitacoes||[]).filter(x=>x.status!=='PENDENTE').slice(-15).reverse();
   const hx=document.getElementById('sol-hist');
   hx.innerHTML=hist.length?`<div class="tw"><table><thead><tr><th>Data</th><th>Líder</th><th>Linha</th><th>OP</th><th>Modelo</th><th>Situação</th><th>Entregue por</th><th>LPN</th></tr></thead><tbody>${hist.map(x=>`<tr>
@@ -2761,21 +2896,26 @@ async function entregarSolic(id){
   if(cu.setor!=='MMT'){toast('Somente o MMT pode confirmar a entrega.','err');return;}
   const sol=(db.solicitacoes||[]).find(x=>x.id===id);if(!sol)return;
   const escolhidos=[];
-  for(let k=0;k<(sol.qty||1);k++){
-    const sel=document.getElementById('sol-pick-'+id+'-'+k);
-    const v=sel?sel.value:'';
-    if(!v){toast('Escolha o tubo '+(k+1)+'.','err');return;}
-    if(escolhidos.includes(v)){toast('O mesmo tubo foi escolhido duas vezes.','err');return;}
-    escolhidos.push(v);
+  if((sol.reservados||[]).length){
+    // v11.5 — entrega travada no que foi reservado na solicitação
+    sol.reservados.forEach(r=>escolhidos.push(r.lpn));
+  }else{
+    for(let k=0;k<(sol.qty||1);k++){
+      const sel=document.getElementById('sol-pick-'+id+'-'+k);
+      const v=sel?sel.value:'';
+      if(!v){toast('Escolha o tubo '+(k+1)+'.','err');return;}
+      if(escolhidos.includes(v)){toast('O mesmo tubo foi escolhido duas vezes.','err');return;}
+      escolhidos.push(v);
+    }
   }
   const fila=db.estoque[sol.modelo]||[];
   const foraFifo=escolhidos.some((lpn,k)=>{const pos=fila.findIndex(it=>it.lpn===lpn);return pos!==k;});
-  if(foraFifo&&!confirm('Você está entregando fora da ordem FIFO.\n\nIsso é permitido quando outro líder chegou primeiro — o próximo da fila fica para quem vier buscar depois.\n\nConfirmar assim mesmo?'))return;
   _solicBusy=true;
   try{
     await DB.pullNow();
     const sol2=(db.solicitacoes||[]).find(x=>x.id===id);
     if(!sol2||sol2.status!=='PENDENTE'){toast('Esta solicitação já foi tratada em outro computador.','warn');_solicHash='';renderSolic();return;}
+    if((sol2.reservados||[]).length){escolhidos.length=0;sol2.reservados.forEach(r=>escolhidos.push(r.lpn));}
     if(!db.emUso)db.emUso={};
     if(!db.emUso[sol2.linha])db.emUso[sol2.linha]=[];
     const ag=agora();const entregues=[];
@@ -2794,6 +2934,87 @@ async function entregarSolic(id){
     sol2.status='ENTREGUE';sol2.entreguePor=cu.nome;sol2.entregueEm=ag.data+' '+ag.hora;sol2.lpns=escolhidos;sol2.foraFifo=foraFifo;
     await save();
     toast('Entregue para '+sol2.lider+': '+entregues.join(', ')+' → '+sol2.linha,'ok');
+    _solicHash='';renderSolic();
+  }finally{_solicBusy=false;}
+}
+
+// ═══ ACEITE EM LOTE (v12.2 · só admin/MMT) ═══
+// Limpeza inicial dos pedidos parados: marca vários pedidos como ENTREGUE de uma vez.
+let _solicSel=new Set();
+function solicEhAdmin(){return !!(cu&&cu.setor==='MMT');}
+function solicMarcar(id,on){if(on)_solicSel.add(id);else _solicSel.delete(id);renderSolicLote(solicPendentes());}
+function solicMarcarTodos(on){
+  _solicSel=new Set(on?solicPendentes().map(x=>x.id):[]);
+  document.querySelectorAll('.sol-chk').forEach(c=>{c.checked=on;});
+  renderSolicLote(solicPendentes());
+}
+function renderSolicLote(pend){
+  const bx=document.getElementById('sol-lote');if(!bx)return;
+  if(!solicEhAdmin()||!pend.length){bx.innerHTML='';_solicSel.clear();return;}
+  // tira da seleção o que não está mais pendente (tratado em outro computador)
+  const ids=new Set(pend.map(x=>x.id));
+  [..._solicSel].forEach(id=>{if(!ids.has(id))_solicSel.delete(id);});
+  const n=_solicSel.size, todos=n===pend.length;
+  bx.innerHTML=`<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;background:#f0f7ff;border:1.5px solid #bee3f8;border-radius:8px;padding:9px 12px;margin-bottom:12px;">
+    <label style="display:inline-flex;align-items:center;gap:6px;cursor:pointer;font-size:12px;font-weight:700;color:#0d1b2e;">
+      <input type="checkbox" ${todos?'checked':''} onchange="solicMarcarTodos(this.checked)" style="width:16px;height:16px;cursor:pointer;">Selecionar todos (${pend.length})</label>
+    <span class="muted" style="font-size:11px;">${n?n+' selecionado(s)':'Marque os pedidos que já foram entregues'}</span>
+    <button class="btn bs btn-sm" style="margin-left:auto;" onclick="aceitarSolicLote()" ${n?'':'disabled'}>✅ Aceitar selecionados${n?' ('+n+')':''}</button>
+  </div>`;
+}
+// Separa, por pedido, os tubos que ainda estão no estoque (saem normalmente) dos que não estão mais
+function solicPlanoLote(sol){
+  const fila=db.estoque[sol.modelo]||[];
+  const res=sol.reservados||[];
+  const saem=res.filter(r=>fila.find(it=>it.lpn===r.lpn)).map(r=>r.lpn);
+  return {saem, semReserva:!res.length, faltam:res.length-saem.length};
+}
+async function aceitarSolicLote(){
+  if(_solicBusy)return;
+  if(!solicEhAdmin()){toast('Somente o login admin (MMT) pode aceitar em lote.','err');return;}
+  const ids=[..._solicSel];
+  if(!ids.length){toast('Selecione ao menos um pedido.','warn');return;}
+  // Prévia do que vai acontecer
+  let tubosSaem=0, soEncerra=0;
+  ids.forEach(id=>{
+    const s=(db.solicitacoes||[]).find(x=>x.id===id);if(!s||s.status!=='PENDENTE')return;
+    const p=solicPlanoLote(s);tubosSaem+=p.saem.length;if(!p.saem.length)soEncerra++;
+  });
+  if(!confirm('Aceitar '+ids.length+' pedido(s) como ENTREGUE?\n\n'+
+    '• '+tubosSaem+' tubo(s) reservado(s) ainda no estoque vão sair normalmente (Histórico + em uso na linha).\n'+
+    '• '+soEncerra+' pedido(s) serão só encerrados, sem mexer no estoque (tubo não está mais no estoque ou pedido antigo sem reserva).\n\n'+
+    'Confirmar?'))return;
+  _solicBusy=true;
+  try{
+    await DB.pullNow();
+    if(!db.emUso)db.emUso={};
+    const ag=agora();
+    let ok=0, ignorados=0, saidas=0;
+    for(const id of ids){
+      const sol2=(db.solicitacoes||[]).find(x=>x.id===id);
+      if(!sol2||sol2.status!=='PENDENTE'){ignorados++;continue;}
+      const p=solicPlanoLote(sol2);
+      const fila=db.estoque[sol2.modelo]||[];
+      const entregues=[];
+      for(const lpn of p.saem){
+        const i=fila.findIndex(it=>it.lpn===lpn);if(i<0)continue;
+        const next=fila.splice(i,1)[0];
+        const fifoNum=next.fifo!=null?next.fifo:'–';
+        if(!db.emUso[sol2.linha])db.emUso[sol2.linha]=[];
+        db.historico.push({id:novoId(),ts:ag.ts,tubo:fifoNum,lpn:next.lpn,linha:sol2.linha,lider:sol2.lider,loginLider:sol2.loginLider,
+          data:ag.data,hora:ag.hora,op:sol2.op,modelo:sol2.modelo,tipo:'SAIDA',chassi:sol2.chassi,qtdKit:sol2.qtdKit,
+          invoice:sol2.invoice,pullList:sol2.pullList,fifo:next.fifo,entreguePor:cu.nome,solicitacaoId:sol2.id,aceiteLote:true});
+        db.emUso[sol2.linha].push({lpn:next.lpn,modelo:sol2.modelo,lider:sol2.lider,data:ag.data,hora:ag.hora,op:sol2.op,tubo:fifoNum,fifo:next.fifo});
+        entregues.push(next.lpn);saidas++;
+      }
+      sol2.status='ENTREGUE';sol2.entreguePor=cu.nome+' (lote)';sol2.entregueEm=ag.data+' '+ag.hora;
+      sol2.lpns=entregues.length?entregues:(sol2.reservados||[]).map(r=>r.lpn);
+      sol2.aceiteLote=true;sol2.semBaixaEstoque=!entregues.length;
+      ok++;
+    }
+    await save();
+    _solicSel.clear();
+    toast(ok+' pedido(s) aceito(s) · '+saidas+' tubo(s) saíram do estoque'+(ignorados?' · '+ignorados+' já tratado(s) em outro computador':''),'ok');
     _solicHash='';renderSolic();
   }finally{_solicBusy=false;}
 }
@@ -2990,6 +3211,9 @@ function renderHist(){
   tb.innerHTML=pagina.map(({r,n})=>{
     const canUndo=isMmt&&(r.tipo==='SAIDA'||!r.tipo);
     const undoBtn=canUndo?`<button class="btn bw btn-sm" onclick="desfazerReq('${r.id}')" title="Desfazer — devolve ao início da fila" style="padding:3px 9px;font-size:10px;">↩ Desfazer</button>`:'';
+    const editBtn=isMmt?`<button class="btn bo2 btn-sm" onclick="abrirEditHist('${r.id}')" title="Corrigir líder / linha" style="padding:3px 9px;font-size:10px;margin-left:4px;">✏️ Editar</button>`:'';
+    const ed=(r.edicoes||[]).length?r.edicoes[r.edicoes.length-1]:null;
+    const edMark=ed?` <span title="${esc('Corrigido por '+ed.por+' em '+ed.em+' · antes: '+(ed.liderDe||'–')+' / '+(ed.linhaDe||'–')+(ed.motivo?' · motivo: '+ed.motivo:''))}" style="cursor:help;">✏️</span>`:'';
     let statusBadge='<span class="muted">—</span>';
     if(r.corrigido)statusBadge=`<span class="badge bb" title="LPN anterior: ${esc(r.lpnAnterior||'–')}">🔁 Corrigida</span>`;
     else if(r.viaCorrecao)statusBadge=`<span class="badge bg">🔁 Via correção</span>`;
@@ -2999,13 +3223,13 @@ function renderHist(){
     <td class="tn">${r.tubo!=null?esc(r.tubo):'–'}</td>
     <td class="tm">${esc(r.lpn||'–')}</td>
     <td><span class="badge bb">${esc(r.linha||'–')}</span></td>
-    <td>${esc(r.lider||'–')}</td>
+    <td>${esc(r.lider||'–')}${edMark}</td>
     <td>${esc(r.data||'–')}</td>
     <td style="color:#7a8fa6;">${esc(r.hora||'–')}</td>
     <td style="font-family:monospace;font-weight:700;">${esc(r.op||'–')}</td>
     <td><span class="badge bgr">${esc(r.modelo||'–')}</span></td>
     <td>${statusBadge}</td>
-    <td>${undoBtn}</td>
+    <td style="white-space:nowrap;">${undoBtn}${editBtn}</td>
   </tr>`;
   }).join('');
 }
@@ -3027,6 +3251,74 @@ async function desfazerReq(id){
   await save();
   toast(`Requisição desfeita — ${r.lpn} voltou ao estoque.`,'ok');
   renderHist();
+}
+
+// ═══ EDITAR LÍDER / LINHA DO HISTÓRICO (v12.2 · só admin/MMT) ═══
+let _editHistId=null;
+function histVinculados(r){
+  // mesmo tubo do mesmo pedido (registro SOLICITACAO ↔ SAIDA)
+  return db.historico.filter(h=>h.id!==r.id&&r.solicitacaoId&&h.solicitacaoId===r.solicitacaoId&&h.lpn===r.lpn);
+}
+function abrirEditHist(id){
+  if(!cu||cu.setor!=='MMT'){toast('Somente o login admin (MMT) pode editar.','err');return;}
+  const r=db.historico.find(h=>h.id===id);if(!r){toast('Registro não encontrado.','err');return;}
+  _editHistId=id;
+  document.getElementById('eh-info').innerHTML=`<b>FIFO #${esc(r.tubo!=null?r.tubo:'–')}</b> · <span style="font-family:monospace;">${esc(r.lpn||'–')}</span> · ${esc(r.modelo||'–')}<br>
+    OP <b>${esc(r.op||'–')}</b> · ${esc(r.data||'–')} ${esc(r.hora||'')}<br>
+    Hoje está: <b>${esc(r.lider||'–')}</b> · <b>${esc(r.linha||'–')}</b>`;
+  const nomes=[...new Set((db.usuarios||[]).map(u=>u.nome).filter(Boolean))].sort((a,b)=>a.localeCompare(b,'pt-BR'));
+  document.getElementById('eh-lider-lista').innerHTML=nomes.map(n=>`<option value="${esc(n)}"></option>`).join('');
+  document.getElementById('eh-lider').value=r.lider||'';
+  const linhas=[...(db.linhas||[])];if(r.linha&&!linhas.includes(r.linha))linhas.unshift(r.linha);
+  document.getElementById('eh-linha').innerHTML=linhas.map(l=>`<option value="${esc(l)}" ${l===r.linha?'selected':''}>${esc(l)}</option>`).join('');
+  document.getElementById('eh-motivo').value='';
+  const v=histVinculados(r).length;
+  document.getElementById('eh-vinc').textContent=v?'A correção também será aplicada ao registro vinculado deste mesmo tubo ('+v+').':'';
+  document.getElementById('eh-err').style.display='none';
+  document.getElementById('m-edit-hist').style.display='flex';
+  setTimeout(()=>document.getElementById('eh-lider').focus(),50);
+}
+async function salvarEditHist(){
+  if(!cu||cu.setor!=='MMT'){toast('Somente o login admin (MMT) pode editar.','err');return;}
+  const err=document.getElementById('eh-err');
+  const lider=(document.getElementById('eh-lider').value||'').trim();
+  const linha=document.getElementById('eh-linha').value;
+  const motivo=(document.getElementById('eh-motivo').value||'').trim();
+  if(!lider||!linha){err.style.display='block';err.textContent='Informe o líder e a linha.';return;}
+  const btn=document.getElementById('eh-save-btn');btn.disabled=true;
+  try{
+    await DB.pullNow();
+    const r=db.historico.find(h=>h.id===_editHistId);
+    if(!r){toast('Este registro não existe mais (pode ter sido removido em outro computador).','warn');closeM('m-edit-hist');renderHist();return;}
+    if(r.lider===lider&&r.linha===linha){err.style.display='block';err.textContent='Nada foi alterado.';return;}
+    const u=(db.usuarios||[]).find(x=>(x.nome||'').trim().toLowerCase()===lider.toLowerCase());
+    const ag=agora();
+    const alvo=[r,...histVinculados(r)];
+    const liderAntigo=r.lider, linhaAntiga=r.linha;
+    alvo.forEach(h=>{
+      if(!h.edicoes)h.edicoes=[];
+      h.edicoes.push({em:ag.data+' '+ag.hora,por:cu.nome,liderDe:h.lider||'',liderPara:lider,linhaDe:h.linha||'',linhaPara:linha,motivo});
+      h.lider=lider;h.linha=linha;h.loginLider=u?u.login:'';
+    });
+    // Solda em uso na linha: acompanha a correção (mesmo LPN e mesma OP)
+    if(db.emUso){
+      for(const ln of Object.keys(db.emUso)){
+        const i=(db.emUso[ln]||[]).findIndex(it=>it.lpn===r.lpn&&(!it.op||!r.op||it.op===r.op));
+        if(i<0)continue;
+        const it=db.emUso[ln][i];it.lider=lider;
+        if(ln!==linha){
+          db.emUso[ln].splice(i,1);if(!db.emUso[ln].length)delete db.emUso[ln];
+          if(!db.emUso[linha])db.emUso[linha]=[];
+          db.emUso[linha].push(it);
+        }
+        break;
+      }
+    }
+    await save();
+    closeM('m-edit-hist');
+    toast('Corrigido: '+(liderAntigo||'–')+' / '+(linhaAntiga||'–')+' → '+lider+' / '+linha,'ok');
+    renderHist();
+  }finally{btn.disabled=false;}
 }
 
 function histFiltrado(){return fltFiltrar(db.historico.map((r,i)=>({r,n:i+1})).reverse()).map(x=>x.r);}
@@ -3430,7 +3722,7 @@ function expXLSXBackup(subset,prefixo){
     r.tubo!=null?r.tubo:'',
     r.lpn||'',r.linha||'',r.lider||'',r.data||'',r.hora||'',r.op||'',r.modelo||'',
     r.chassi||'',r.qtdKit||'',r.invoice||'',r.pullList||'',
-    r.tipo==='DEVOLUCAO'?'Devolução':r.tipo==='DEVOLUCAO_FORCADA'?'Dev. Forçada':r.tipo==='SAIDA'?'Saída':r.tipo||'Saída'
+    r.tipo==='DEVOLUCAO'?'Devolução':r.tipo==='DEVOLUCAO_FORCADA'?'Dev. Forçada':r.tipo==='SOLICITACAO'?'Solicitação':r.tipo==='SAIDA'?'Saída':r.tipo||'Saída'
   ]);
   const wsData=[headers,...rows];
   const ws=XLSX.utils.aoa_to_sheet(wsData);
