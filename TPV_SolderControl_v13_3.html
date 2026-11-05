@@ -1779,7 +1779,23 @@ const PASTA={
   async confirmacao(dh){
     let txt=null;try{txt=await PASTA.ler(dh,PASTA.CONFIRMACAO);}catch(e){return null;}
     if(!txt)return null;
-    try{const o=JSON.parse(txt);return o&&PASTA.SISTEMAS_OK.includes(o.sistema)?o:null;}catch(e){return null;}
+    // tolera o "BOM" que alguns editores (Bloco de Notas) colocam no início do arquivo
+    try{const o=JSON.parse(txt.replace(/^\uFEFF/,'').trim());return o&&PASTA.SISTEMAS_OK.includes(o.sistema)?o:null;}catch(e){return null;}
+  },
+  // Diz POR QUE a confirmação não foi aceita (para a mensagem ao usuário)
+  async motivoConfirmacao(dh){
+    let txt=null;try{txt=await PASTA.ler(dh,PASTA.CONFIRMACAO);}catch(e){return 'Não consegui ler a pasta: '+e.message;}
+    if(txt==null){
+      const parecidos=[];
+      try{for await(const [n,h] of dh.entries())if(h.kind==='file'&&/^solda_pasta_do_sistema/i.test(n))parecidos.push(n);}catch(e){}
+      if(parecidos.length)return 'Achei "'+parecidos.join('", "')+'", mas o nome tem que ser exatamente '+PASTA.CONFIRMACAO+
+        '.\n(O Windows costuma esconder a extensão e o arquivo fica como ".json.txt" ou ".json.json". No Explorador: Exibir > Extensões de nomes de arquivos, e renomeie.)';
+      return 'Falta o arquivo '+PASTA.CONFIRMACAO+' dentro dela.';
+    }
+    try{const o=JSON.parse(txt.replace(/^\uFEFF/,'').trim());
+      if(!o||!PASTA.SISTEMAS_OK.includes(o.sistema))return 'O arquivo '+PASTA.CONFIRMACAO+' existe, mas o conteúdo está diferente. Tem que ser exatamente:\n{"sistema":"SOLDA_MMT"}\n(está: '+txt.trim().slice(0,80)+')';}
+    catch(e){return 'O arquivo '+PASTA.CONFIRMACAO+' existe, mas o conteúdo não é válido. Tem que ser exatamente:\n{"sistema":"SOLDA_MMT"}\n(está: '+txt.trim().slice(0,80)+')';}
+    return null;
   },
   async abrirHandles(dh){
     PASTA.raiz=dh;
@@ -2461,7 +2477,7 @@ async function selectDB(){
     }
     let temDados=false;try{await dh.getDirectoryHandle('dados');temDados=true;}catch(e){}
     if(_nomePastaOk(dh)&&!temDados){
-      alert('A pasta "'+dh.name+'" ainda NÃO está preparada para o sistema.\n\nFalta o arquivo '+PASTA.CONFIRMACAO+' dentro dela, com o conteúdo:\n{"sistema":"SOLDA_MMT"}\n\nEsse arquivo é colocado à mão, uma vez só, pelo responsável do sistema (MMT). Nada foi alterado.');return;
+      alert('A pasta "'+dh.name+'" ainda NÃO está preparada para o sistema.\n\n'+(await PASTA.motivoConfirmacao(dh))+'\n\nEsse arquivo é colocado à mão, uma vez só, pelo responsável do sistema (MMT). Nada foi alterado.');return;
     }
     if(!confirm('A pasta "'+dh.name+'" NÃO é a pasta do sistema.'+(dh.name.toLowerCase()==='dados'?'\nNão entre em "dados": escolha a pasta de CIMA.':'')+
       '\n\nEscolha:\n'+PASTA_FIXA+'\n(o endereço já está no Ctrl+V: cole na barra da janela e dê Enter)\n\nNada foi alterado. Tentar de novo?'))return;
