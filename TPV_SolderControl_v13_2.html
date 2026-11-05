@@ -2369,6 +2369,10 @@ async function selectDB(){
       if(!await _permissaoPasta(dh,true)){_erroPasta('Permissão de gravação negada. Clique em Conectar Sistema de novo.');return;}
       await _concluirConexao(dh);return;
     }
+    let temDados=false;try{await dh.getDirectoryHandle('dados');temDados=true;}catch(e){}
+    if(dh.name.toLowerCase()!=='dados'&&!temDados){
+      alert('A pasta "'+dh.name+'" ainda NÃO está preparada para o sistema.\n\nFalta o arquivo '+PASTA.CONFIRMACAO+' dentro dela, com o conteúdo:\n{"sistema":"SOLDA_MMT"}\n\nEsse arquivo é colocado à mão, uma vez só, pelo responsável do sistema (MMT). Nada foi alterado.');return;
+    }
     if(!confirm('A pasta "'+dh.name+'" NÃO é a pasta do sistema.'+(dh.name.toLowerCase()==='dados'?'\nNão entre em "dados": escolha a pasta de CIMA.':'')+
       '\n\nEscolha:\n'+PASTA_FIXA+'\n(o endereço já está no Ctrl+V: cole na barra da janela e dê Enter)\n\nNada foi alterado. Tentar de novo?'))return;
   }
