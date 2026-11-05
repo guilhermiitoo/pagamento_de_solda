@@ -3,7 +3,7 @@
 const fs=require('fs'),vm=require('vm');
 const {carregar}=require('./harness.js');
 const RAIZ=require('path').join(__dirname,'..');
-const c=carregar(RAIZ+'/TPV_SolderControl_v13_2.html');
+const c=carregar(RAIZ+'/TPV_SolderControl_v13_3.html');
 c.toast=()=>{};c.refreshView=()=>{};c.setSync=()=>{};
 
 const real=JSON.parse(fs.readFileSync(RAIZ+'/ARQUIVO LIMPO 10-06 .json','utf8'));

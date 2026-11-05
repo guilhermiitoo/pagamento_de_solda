@@ -1,6 +1,6 @@
 # Testes do Sistema de Solda
 
-Rodam contra o próprio `TPV_SolderControl_v13_2.html`, sem servidor e sem internet.
+Rodam contra o próprio `TPV_SolderControl_v13_3.html`, sem servidor e sem internet.
 
 ```bash
 cd testes

@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>TPV – Controle de Pagamento de Solda v13.2</title>
+<title>TPV – Controle de Pagamento de Solda v13.3</title>
 <!-- v12.0: 100% OFFLINE. Nenhum recurso é buscado na internet.
      A política abaixo bloqueia qualquer tentativa de acesso externo (http/https),
      mesmo que algum trecho futuro tente. Fonte, gráficos e leitor de planilha
@@ -823,7 +823,7 @@ tbody tr:hover{background:#eef5fc;}
 
       <!-- REQUISIÇÃO -->
       <div class="page" id="page-requisicao">
-        <div class="ph mb20"><div><div class="ph-title">Requisição de Solda</div><div class="ph-sub">Solicite a solda · o MMT entrega em mãos e confirma na aba "Solicitação da Produção"</div></div></div>
+        <div class="ph mb20"><div><div class="ph-title">Requisição de Solda</div><div class="ph-sub">Solicite a solda · os tubos saem do estoque FIFO na hora, por ordem de chegada</div></div></div>
 
         <!-- Minhas solicitações aguardando o MMT -->
         <div id="rq-pend-bar" style="display:none;margin-bottom:12px;"></div>
@@ -891,7 +891,7 @@ tbody tr:hover{background:#eef5fc;}
                 <div id="rq-preview-cards"></div>
               </div>
             </div>
-            <div class="mt20"><button class="btn bs btn-lg" id="btn-confirmar-req" style="width:100%" onclick="confirmarReq()">✅ ENVIAR SOLICITAÇÃO AO MMT</button></div>
+            <div class="mt20"><button class="btn bs btn-lg" id="btn-confirmar-req" style="width:100%" onclick="confirmarReq()">✅ CONFIRMAR REQUISIÇÃO (BAIXA FIFO)</button></div>
           </div>
 
           <div class="card" id="rq-fifo-card" style="display:none;">
@@ -1579,7 +1579,7 @@ tbody tr:hover{background:#eef5fc;}
        quantidade reduzida ou cancelada, com aviso). Mais de 10 min sem rede: a líder confirma.
      - Migração automática: o JSON antigo da pasta vira <nome>_MIGRADO_<data>.bak.
    ═══════════════════════════════════════════════════════════════ */
-const VERSAO='v13.2';
+const VERSAO='v13.3';
 document.addEventListener('DOMContentLoaded',()=>document.querySelectorAll('.js-versao').forEach(e=>{e.textContent=VERSAO;}));
 
 // ═══ DATABASE ═══
@@ -2569,7 +2569,7 @@ function doLogout(){
 }
 
 // ═══ APP ═══
-const NAV_MMT=[{id:'dashboard',ic:'<svg class="ico" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 20V10M10 20V4M16 20v-7M22 20H2"/></svg>',lb:'Dashboard'},{id:'estoque',ic:'<svg class="ico" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 8 12 3 3 8v8l9 5 9-5z"/><path d="M3 8l9 5 9-5M12 13v8"/></svg>',lb:'Estoque FIFO'},{id:'requisicao',ic:'<svg class="ico" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 12a9 9 0 0 1 15.5-6.2L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-15.5 6.2L3 16"/><path d="M3 21v-5h5"/></svg>',lb:'Requisição'},{id:'solicitacoes',ic:'<svg class="ico" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 6h11v10H3zM14 10h4l3 3v3h-7"/><circle cx="7" cy="18" r="2"/><circle cx="17" cy="18" r="2"/></svg>',lb:'Solicitação da Produção'},{id:'historico',ic:'<svg class="ico" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="5" y="4" width="14" height="17" rx="2"/><path d="M9 4V3h6v1M9 10h6M9 14h6M9 18h4"/></svg>',lb:'Histórico'},{id:'analise',ic:'<svg class="ico" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v18M7 21h10M5 7h14"/><path d="M5 7l-3 6a3 3 0 0 0 6 0zM19 7l-3 6a3 3 0 0 0 6 0z"/></svg>',lb:'Plano WH x Pago'},{id:'correcao',ic:'<svg class="ico" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M17 2l4 4-4 4"/><path d="M3 11V9a3 3 0 0 1 3-3h15M7 22l-4-4 4-4"/><path d="M21 13v2a3 3 0 0 1-3 3H3"/></svg>',lb:'Correção de Solda'},{id:'etiqueta',ic:'<svg class="ico" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20.6 13.4 13.4 20.6a2 2 0 0 1-2.8 0L3 13V3h10l7.6 7.6a2 2 0 0 1 0 2.8z"/><circle cx="8" cy="8" r="1.5"/></svg>',lb:'Etiqueta'},{id:'config',ic:'<svg class="ico" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg>',lb:'Configurações'},{id:'limpeza',ic:'<svg class="ico" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 6h18M8 6V4h8v2M6 6l1 14a2 2 0 0 0 2 2h6a2 2 0 0 0 2-2l1-14M10 11v6M14 11v6"/></svg>',lb:'Limpeza do Banco'}];
+const NAV_MMT=[{id:'dashboard',ic:'<svg class="ico" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 20V10M10 20V4M16 20v-7M22 20H2"/></svg>',lb:'Dashboard'},{id:'estoque',ic:'<svg class="ico" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 8 12 3 3 8v8l9 5 9-5z"/><path d="M3 8l9 5 9-5M12 13v8"/></svg>',lb:'Estoque FIFO'},{id:'requisicao',ic:'<svg class="ico" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 12a9 9 0 0 1 15.5-6.2L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-15.5 6.2L3 16"/><path d="M3 21v-5h5"/></svg>',lb:'Requisição'},{id:'historico',ic:'<svg class="ico" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="5" y="4" width="14" height="17" rx="2"/><path d="M9 4V3h6v1M9 10h6M9 14h6M9 18h4"/></svg>',lb:'Histórico'},{id:'correcao',ic:'<svg class="ico" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M17 2l4 4-4 4"/><path d="M3 11V9a3 3 0 0 1 3-3h15M7 22l-4-4 4-4"/><path d="M21 13v2a3 3 0 0 1-3 3H3"/></svg>',lb:'Correção de Solda'},{id:'etiqueta',ic:'<svg class="ico" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20.6 13.4 13.4 20.6a2 2 0 0 1-2.8 0L3 13V3h10l7.6 7.6a2 2 0 0 1 0 2.8z"/><circle cx="8" cy="8" r="1.5"/></svg>',lb:'Etiqueta'},{id:'config',ic:'<svg class="ico" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg>',lb:'Configurações'},{id:'limpeza',ic:'<svg class="ico" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 6h18M8 6V4h8v2M6 6l1 14a2 2 0 0 0 2 2h6a2 2 0 0 0 2-2l1-14M10 11v6M14 11v6"/></svg>',lb:'Limpeza do Banco'}];
 const NAV_PD=[{id:'requisicao',ic:'<svg class="ico" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 12a9 9 0 0 1 15.5-6.2L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-15.5 6.2L3 16"/><path d="M3 21v-5h5"/></svg>',lb:'Requisição'},{id:'historico',ic:'<svg class="ico" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="5" y="4" width="14" height="17" rx="2"/><path d="M9 4V3h6v1M9 10h6M9 14h6M9 18h4"/></svg>',lb:'Histórico'},{id:'correcao',ic:'<svg class="ico" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M17 2l4 4-4 4"/><path d="M3 11V9a3 3 0 0 1 3-3h15M7 22l-4-4 4-4"/><path d="M21 13v2a3 3 0 0 1-3 3H3"/></svg>',lb:'Correção de Solda'}];
 const TITULOS={dashboard:'Dashboard',estoque:'Estoque FIFO',requisicao:'Requisição de Solda',solicitacoes:'Solicitação da Produção · Entrega MMT',historico:'Histórico',analise:'Plano WH x Solda Paga · Análise por OP',correcao:'Correção de Solda',etiqueta:'Etiqueta',config:'Configurações',limpeza:'Limpeza do Banco'};
 
@@ -2586,7 +2586,7 @@ function startApp(){
   _clockInt=setInterval(()=>{document.getElementById('tb-clock').textContent=new Date().toLocaleString('pt-BR');},1000);
   document.getElementById('tb-clock').textContent=new Date().toLocaleString('pt-BR');
   clearInterval(_syncInt);
-  _syncInt=setInterval(()=>DB.pull(),2000);
+  _syncInt=setInterval(()=>{DB.pull().then(()=>baixaAutomatica()).catch(()=>{});},2000);
 }
 
 function buildNav(){
@@ -2597,6 +2597,7 @@ function buildNav(){
 
 // Troca de aba: prepara formulários e dá foco (só aqui — nunca no sync)
 function switchTab(t){
+  if(t==='solicitacoes'||t==='analise')t=cu&&cu.setor==='MMT'?'dashboard':'requisicao';   // abas removidas na v13.3
   _tab=t;
   document.querySelectorAll('.sb-item').forEach(e=>e.classList.remove('active'));
   document.querySelectorAll('.page').forEach(e=>e.classList.remove('active'));
@@ -3412,7 +3413,10 @@ async function confirmarReq(){
     if(!res.ok){renderQuotaBar();renderMinhasSolic();onRqChange();renderRqFIFO();return;}   // conflito: aviso já mostrado
     const avisou=(res.avisos||[]).some(a=>a.sol.id===solId);
     if(solFinal&&solFinal.status==='CANCELADA'){renderQuotaBar();renderMinhasSolic();onRqChange();renderRqFIFO();return;}
-    if(!avisou)toast('Solicitação enviada ao MMT. Tubo(s) reservado(s): '+(solFinal?solFinal.reservados:reservados).map(r=>'#'+(r.fifo!=null?r.fifo:'–')).join(', ')+'. Retire no balcão.','ok');
+    const baixados=await baixaAutomatica();
+    const tub=(solFinal?solFinal.reservados:reservados).map(r=>'#'+(r.fifo!=null?r.fifo:'–')).join(', ');
+    if(!baixados||!baixados.includes(solId))toast('Reserva gravada ('+tub+'). A baixa no estoque será feita em seguida.','warn',8000);
+    else if(!avisou)toast('Solda baixada do estoque FIFO: '+tub+' → '+ln+'. Retire no balcão.','ok',8000);
     ['rq-op2','rq-plano-modelo','rq-chassi','rq-qtdkit','rq-invoice','rq-pulllist'].forEach(id=>document.getElementById(id).value='');
     document.getElementById('rq-linha').value='';
     document.getElementById('rq-linha-display').value='';
@@ -3420,7 +3424,7 @@ async function confirmarReq(){
     document.getElementById('rq-qty').value='1';
     window._planoParsed=null;
     renderQuotaBar();renderMinhasSolic();onRqChange();renderRqFIFO();
-  }finally{_reqBusy=false;if(btn){btn.disabled=false;btn.textContent='✅ ENVIAR SOLICITAÇÃO AO MMT';}}
+  }finally{_reqBusy=false;if(btn){btn.disabled=false;btn.textContent='✅ CONFIRMAR REQUISIÇÃO (BAIXA FIFO)';}}
 }
 
 // Solicitações do próprio líder ainda aguardando o MMT
@@ -3430,7 +3434,7 @@ function renderMinhasSolic(){
   if(!mn.length){bar.style.display='none';bar.innerHTML='';return;}
   bar.style.display='block';
   bar.innerHTML=`<div style="background:#fff8e1;border:1.5px solid #ffe082;border-radius:8px;padding:10px 14px;">
-    <div style="font-size:11px;font-weight:800;color:#e65100;text-transform:uppercase;letter-spacing:0.8px;margin-bottom:6px;">⏳ Aguardando o MMT entregar (${mn.length})</div>
+    <div style="font-size:11px;font-weight:800;color:#e65100;text-transform:uppercase;letter-spacing:0.8px;margin-bottom:6px;">⏳ Aguardando baixa no estoque (${mn.length})</div>
     ${mn.map(x=>`<div style="font-size:12px;color:#22394f;">• ${esc(x.modelo)} · ${x.qty} tubo(s) · ${esc(x.linha)} · OP ${esc(x.op)} <span class="muted">(${esc(x.data)} ${esc(x.hora)})</span>${DB.naoEnviadas[x.id]?' <b style="color:#c0392b;">📡 NÃO ENVIADA (sem conexão) — não retire o tubo</b>':''}</div>`).join('')}
   </div>`;
 }
@@ -3631,6 +3635,44 @@ async function aceitarSolicLote(){
     toast(ok+' pedido(s) aceito(s) · '+saidas+' tubo(s) saíram do estoque'+(ignorados?' · '+ignorados+' já tratado(s) em outro computador':''),'ok');
     _solicHash='';renderSolic();
   }finally{_solicBusy=false;}
+}
+
+// ═══ BAIXA FIFO AUTOMÁTICA (v13.3) ═══
+// A aba "Solicitação da Produção" saiu. A requisição da líder reserva os tubos
+// (com a trava contra tubo duplicado) e, assim que a reserva está gravada na
+// rede, os tubos saem do estoque FIFO: SAÍDA no histórico + "em uso" na linha.
+// Pedido feito sem rede: a baixa acontece quando a rede volta.
+let _baixaRodando=false;
+function _solicParaBaixa(){
+  return (db.solicitacoes||[]).filter(s=>s.status==='PENDENTE'&&!DB.naoEnviadas[s.id]&&(s.reservados||[]).length);
+}
+async function baixaAutomatica(){
+  if(_baixaRodando||!db||!dbHandle||DB.offline||DB.sujo||DB.writing||DB.fila||DB.mutando>0)return null;
+  if(!_solicParaBaixa().length)return null;
+  _baixaRodando=true;
+  try{
+    await DB.pullNow();
+    const pend=_solicParaBaixa();
+    if(!pend.length){DB._fimOp();return null;}
+    if(!db.emUso)db.emUso={};
+    const ag=agora(),feitas=[];
+    for(const sol of pend){
+      const fila=db.estoque[sol.modelo]||[],lpns=[];
+      for(const r of sol.reservados){
+        const i=fila.findIndex(it=>it.lpn===r.lpn);if(i<0)continue;
+        const t=fila.splice(i,1)[0],fifoNum=t.fifo!=null?t.fifo:'–';
+        db.historico.push({id:novoId(),ts:ag.ts,tubo:fifoNum,lpn:t.lpn,linha:sol.linha,lider:sol.lider,loginLider:sol.loginLider,
+          data:ag.data,hora:ag.hora,op:sol.op,modelo:sol.modelo,tipo:'SAIDA',chassi:sol.chassi,qtdKit:sol.qtdKit,
+          invoice:sol.invoice,pullList:sol.pullList,fifo:t.fifo,entreguePor:'Baixa automática',solicitacaoId:sol.id});
+        (db.emUso[sol.linha]=db.emUso[sol.linha]||[]).push({lpn:t.lpn,modelo:sol.modelo,lider:sol.lider,data:ag.data,hora:ag.hora,op:sol.op,tubo:fifoNum,fifo:t.fifo});
+        lpns.push(t.lpn);
+      }
+      sol.status='ENTREGUE';sol.entreguePor='Baixa automática';sol.entregueEm=ag.data+' '+ag.hora;sol.lpns=lpns;sol.semBaixaEstoque=!lpns.length;
+      feitas.push(sol);
+    }
+    const res=await save();
+    return res&&res.ok?feitas.map(x=>x.id):null;
+  }finally{_baixaRodando=false;}
 }
 
 async function cancelarSolic(id){

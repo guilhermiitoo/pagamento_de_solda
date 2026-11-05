@@ -7,7 +7,7 @@
 const fs=require('fs'),path=require('path'),http=require('http');
 const {chromium}=require('playwright');
 const RAIZ=path.join(__dirname,'..');
-const HTML=path.resolve(process.argv[3]||path.join(RAIZ,'TPV_SolderControl_v13_2.html'));
+const HTML=path.resolve(process.argv[3]||path.join(RAIZ,'TPV_SolderControl_v13_3.html'));
 const BANCO=JSON.parse(fs.readFileSync(process.argv[2]||path.join(RAIZ,'ARQUIVO LIMPO 10-06 .json'),'utf8'));
 
 let falhas=0;
@@ -75,12 +75,14 @@ BANCO.solicitacoes=(BANCO.solicitacoes||[]).map(s=>s.status==='PENDENTE'?{...s,s
     return{toasts:__toasts.slice(n0).map(t=>t[1]),sol:sol&&{id:sol.id,status:sol.status,tubos:sol.reservados.map(t=>t.lpn)}};
   },[lider,mod,qty]);
   const estado=p=>p.evaluate(async()=>{await DB.pullNow();DB._fimOp();return{
+    saidaDupla:(()=>{const c={};db.historico.filter(h=>h.tipo==='SAIDA'&&/^TT[XY]/.test(h.lpn)).forEach(h=>c[h.lpn]=(c[h.lpn]||0)+1);return Object.values(c).filter(n=>n>1).length;})(),
     pend:db.solicitacoes.filter(s=>s.status==='PENDENTE').map(s=>({id:s.id,lider:s.lider,tubos:s.reservados.map(t=>t.lpn)})),
     sig:JSON.stringify([db.estoque,db.emUso,db.solicitacoes,db.historico.map(h=>h.id+h.lpn+h.tipo).sort()])};});
   const invariantes=async(rotulo)=>{
     const [ea,eb]=[await estado(A),await estado(B)];
     const lp=ea.pend.flatMap(s=>s.tubos);
     ok(lp.length===new Set(lp).size,rotulo+': nenhum tubo reservado para duas solicitações');
+    ok(ea.saidaDupla===0,rotulo+': nenhum tubo com duas SAÍDAS (baixa dupla)');
     ok(ea.sig===eb.sig,rotulo+': os dois PCs têm exatamente o mesmo banco');
     return ea;};
 
@@ -91,22 +93,25 @@ BANCO.solicitacoes=(BANCO.solicitacoes||[]).map(s=>s.status==='PENDENTE'?{...s,s
   const avisoA=ra.toasts.find(t=>/já tinha sido reservado por/.test(t)),avisoB=rb.toasts.find(t=>/já tinha sido reservado por/.test(t));
   ok(!!avisoA!==!!avisoB,'só a segunda recebeu o aviso');
   console.log('     aviso: "'+(avisoA||avisoB)+'"');
-  ok((avisoA&&!ra.toasts.some(t=>/enviada ao MMT/.test(t)))||(avisoB&&!rb.toasts.some(t=>/enviada ao MMT/.test(t))),'quem recebeu o aviso NÃO viu o "OK" normal');
+  ok((avisoA&&!ra.toasts.some(t=>/baixada do estoque/.test(t)))||(avisoB&&!rb.toasts.some(t=>/baixada do estoque/.test(t))),'quem recebeu o aviso NÃO viu o "OK" normal');
   await invariantes('a');
+  const estTTX=await A.evaluate(()=>{const l=db.estoque.TTX.map(t=>t.lpn);return l;});
+  ok(![ra.sol.tubos[0],rb.sol.tubos[0]].some(l=>estTTX.includes(l)),'BAIXA FIFO: os tubos pedidos saíram do estoque ('+estTTX.length+' restantes)');
+  ok(await A.evaluate(l=>l.every(x=>db.historico.some(h=>h.tipo==='SAIDA'&&h.lpn===x)),[ra.sol.tubos[0],rb.sol.tubos[0]]),'BAIXA FIFO: cada tubo tem a SAÍDA no histórico');
 
   // ---------- b) tubos diferentes ao mesmo tempo ----------
   console.log('\nb) Solicitações de tubos diferentes ao mesmo tempo');
   const [ba,bb]=await Promise.all([pedir(A,'Keyla','TTX',1),pedir(B,'Vilma','TTY',1)]);
-  ok(ba.sol.status==='PENDENTE'&&bb.sol.status==='PENDENTE','as duas gravaram');
+  ok(ba.sol.status==='ENTREGUE'&&bb.sol.status==='ENTREGUE','as duas gravaram e deram baixa');
   ok(!ba.toasts.concat(bb.toasts).some(t=>/já tinha sido|NÃO foi gravada|SEM CONEX/.test(t)),'nenhum aviso');
-  ok(ba.toasts.some(t=>/enviada ao MMT/.test(t))&&bb.toasts.some(t=>/enviada ao MMT/.test(t)),'as duas viram o OK');
+  ok(ba.toasts.some(t=>/baixada do estoque/.test(t))&&bb.toasts.some(t=>/baixada do estoque/.test(t)),'as duas viram o OK');
   await invariantes('b');
 
   // ---------- c) PC sem rede faz pedido, outro pega os tubos, o primeiro volta ----------
   console.log('\nc) PC sem Wi-Fi faz pedido; outro PC pega os tubos; o primeiro reconecta');
   await A.evaluate(()=>{window.__off=true;});
   const ca=await pedir(A,'Glacivaldo','TTX',2);
-  ok(ca.toasts.some(t=>/SEM CONEXÃO — solicitação NÃO enviada/.test(t))&&!ca.toasts.some(t=>/enviada ao MMT/.test(t)),'sem rede: aparece "SEM CONEXÃO — solicitação NÃO enviada" (sem OK)');
+  ok(ca.toasts.some(t=>/SEM CONEXÃO — solicitação NÃO enviada/.test(t))&&!ca.toasts.some(t=>/baixada do estoque/.test(t)),'sem rede: aparece "SEM CONEXÃO — solicitação NÃO enviada" (sem OK)');
   ok(await A.evaluate(()=>/SEM CONEXÃO/.test((document.getElementById('banner-rede')||{}).textContent||'')),'faixa vermelha "SEM CONEXÃO" na tela');
   const tubosOffline=ca.sol.tubos;
   const cb=await pedir(B,'Anderson','TTX',2);
@@ -114,12 +119,13 @@ BANCO.solicitacoes=(BANCO.solicitacoes||[]).map(s=>s.status==='PENDENTE'?{...s,s
   const n0=await A.evaluate(()=>__toasts.length);
   await A.evaluate(()=>{window.__off=false;});
   await A.waitForFunction(()=>!DB.sujo&&!DB.writing&&!Object.keys(DB.naoEnviadas).length,null,{timeout:30000});
+  await A.waitForFunction(id=>(db.solicitacoes.find(x=>x.id===id)||{}).status==='ENTREGUE',ca.sol.id,{timeout:30000}).catch(()=>{});
   const cfim=await A.evaluate(([n0,id])=>{const s=db.solicitacoes.find(x=>x.id===id);return{toasts:__toasts.slice(n0).map(t=>t[1]),tubos:s.reservados.map(t=>t.lpn),status:s.status};},[n0,ca.sol.id]);
-  ok(cfim.tubos.every(t=>!tubosOffline.includes(t))&&cfim.status==='PENDENTE','ao reconectar, o pedido foi CORRIGIDO para outros tubos: '+cfim.tubos);
+  ok(cfim.tubos.every(t=>!tubosOffline.includes(t))&&cfim.status==='ENTREGUE','ao reconectar, o pedido foi CORRIGIDO para outros tubos: '+cfim.tubos);
   console.log('     aviso: "'+(cfim.toasts.find(t=>/já tinha sido/.test(t))||'(nenhum)')+'"');
   ok(cfim.toasts.some(t=>/já tinha sido reservado por Anderson/.test(t)),'e a líder recebeu o aviso com o nome de quem pegou');
   const ec=await invariantes('c');
-  ok(ec.pend.find(s=>s.lider==='Anderson').tubos.join()===tubosOffline.join(),'nada sobrescrito: o pedido do Anderson continua com os tubos dele');
+  ok(await A.evaluate(([id,t])=>{const s=db.solicitacoes.find(x=>x.id===id);return s.reservados.map(r=>r.lpn).join()===t&&s.status==='ENTREGUE';},[cb.sol.id,tubosOffline.join()]),'nada sobrescrito: o pedido do Anderson continua com os tubos dele');
 
   console.log('\nc2) Sem rede por mais de 10 minutos: pede confirmação antes de enviar');
   await A.evaluate(()=>{window.__off=true;});
@@ -128,8 +134,9 @@ BANCO.solicitacoes=(BANCO.solicitacoes||[]).map(s=>s.status==='PENDENTE'?{...s,s
   A._dialogos=0;
   await A.evaluate(()=>{window.__off=false;});
   await A.waitForFunction(()=>!DB.sujo&&!DB.writing&&!Object.keys(DB.naoEnviadas).length,null,{timeout:30000});
+  await A.waitForFunction(id=>(db.solicitacoes.find(x=>x.id===id)||{}).status==='ENTREGUE',c2.sol.id,{timeout:30000}).catch(()=>{});
   ok(A._dialogos>=1,'a líder confirmou ("o estoque mudou enquanto você estava sem rede") antes de gravar');
-  ok(await A.evaluate(id=>(db.solicitacoes.find(s=>s.id===id)||{}).status==='PENDENTE',c2.sol.id),'pedido enviado depois da confirmação');
+  ok(await A.evaluate(id=>(db.solicitacoes.find(s=>s.id===id)||{}).status==='ENTREGUE',c2.sol.id),'pedido enviado depois da confirmação');
   await invariantes('c2');
 
   // ---------- d) novos saves dos dois PCs não apagam nada do outro ----------
@@ -137,19 +144,20 @@ BANCO.solicitacoes=(BANCO.solicitacoes||[]).map(s=>s.status==='PENDENTE'?{...s,s
   const antes=await estado(A);
   const [d1,d2]=await Promise.all([pedir(A,'Lucimara','TTY',1),pedir(B,'Valcineide','TTX',1)]);
   const depois=await invariantes('d');
-  ok(antes.pend.every(s=>depois.pend.some(x=>x.id===s.id&&x.tubos.join()===s.tubos.join())),'todas as solicitações anteriores continuam iguais');
-  ok([d1,d2].every(r=>depois.pend.some(x=>x.id===r.sol.id)),'as duas novas também estão lá');
+  ok(await A.evaluate(l=>l.every(s=>db.solicitacoes.some(x=>x.id===s.id&&x.reservados.map(r=>r.lpn).join()===s.tubos.join())),antes.pend),'todas as solicitações anteriores continuam iguais');
+  ok(await A.evaluate(ids=>ids.every(id=>db.solicitacoes.some(x=>x.id===id&&x.status==='ENTREGUE')),[d1.sol.id,d2.sol.id]),'as duas novas também estão lá');
 
-  // ---------- e) dois MMT entregam a MESMA solicitação ao mesmo tempo ----------
-  console.log('\ne) Dois PCs do MMT entregam a MESMA solicitação ao mesmo tempo');
-  const alvo=depois.pend.find(s=>s.lider==='Keyla');
-  const ent=p=>p.evaluate(async id=>{cu=db.usuarios.find(u=>u.setor==='MMT');const n0=__toasts.length;await entregarSolic(id);return __toasts.slice(n0).map(t=>t[1]);},alvo.id);
-  const [ea,eb]=await Promise.all([ent(A),ent(B)]);
-  const okE=[ea,eb].filter(t=>t.some(x=>/^Entregue para/.test(x))).length;
-  ok(okE===1,'só um PC viu "Entregue"; o outro foi avisado ('+(ea.concat(eb).find(x=>/NÃO foi gravada|já foi tratada/.test(x))||'?').slice(0,90)+'…)');
-  const fe=await invariantes('e');
-  const saidas=await A.evaluate(l=>db.historico.filter(h=>h.tipo==='SAIDA'&&h.lpn===l).length,alvo.tubos[0]);
+  // ---------- e) dois PCs dão baixa no MESMO pedido ao mesmo tempo ----------
+  console.log('\ne) Dois PCs fazem a baixa automática do MESMO pedido ao mesmo tempo');
+  for(const p of [A,B])await p.evaluate(()=>{window.__baixa=baixaAutomatica;window.baixaAutomatica=async()=>null;});
+  const pe=await pedir(A,'Keyla','TTY',1);
+  ok(pe.sol.status==='PENDENTE','pedido gravado com a baixa ainda pendente');
+  await B.evaluate(async()=>{await DB.pullNow();DB._fimOp();});
+  const [xa,xb]=await Promise.all([A,B].map(p=>p.evaluate(async()=>{window.baixaAutomatica=window.__baixa;return await baixaAutomatica();})));
+  await invariantes('e');
+  const saidas=await A.evaluate(l=>db.historico.filter(h=>h.tipo==='SAIDA'&&h.lpn===l).length,pe.sol.tubos[0]);
   ok(saidas===1,'o tubo saiu UMA vez só (1 linha de SAÍDA no histórico)');
+  ok(await A.evaluate(id=>db.solicitacoes.find(s=>s.id===id).status==='ENTREGUE',pe.sol.id),'pedido baixado');
 
   ok(!erros.length,'nenhum erro de JavaScript'+(erros.length?': '+erros.join(' | '):''));
   console.log('\n'+(falhas?'>>> '+falhas+' FALHA(S)':'>>> TUDO OK'));
