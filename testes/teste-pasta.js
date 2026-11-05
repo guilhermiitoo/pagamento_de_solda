@@ -1,7 +1,7 @@
 // TESTE DE REDE v13 — Simulador: vários "PCs" (contextos isolados) gravando na mesma pasta em memória.
 const vm=require('vm'),fs=require('fs');
 // uso: node teste-pasta.js [banco.json] [html]    LAT=40 node teste-pasta.js ...  (latência por operação, ms)
-const HTML=process.argv[3]||__dirname+'/../TPV_SolderControl_v13_1.html';
+const HTML=process.argv[3]||__dirname+'/../TPV_SolderControl_v13_2.html';
 const APP=fs.readFileSync(HTML,'utf8').match(/<script>([\s\S]*?)<\/script>/)[1];
 const rnd=(a,b)=>a+Math.random()*(b-a);
 const LAT=+process.env.LAT||3;   // latência média (ms) de cada operação de arquivo

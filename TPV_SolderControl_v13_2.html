@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>TPV – Controle de Pagamento de Solda v13.1</title>
+<title>TPV – Controle de Pagamento de Solda v13.2</title>
 <!-- v12.0: 100% OFFLINE. Nenhum recurso é buscado na internet.
      A política abaixo bloqueia qualquer tentativa de acesso externo (http/https),
      mesmo que algum trecho futuro tente. Fonte, gráficos e leitor de planilha
@@ -549,29 +549,12 @@ textarea.fc{resize:vertical;min-height:75px;}
       <div style="font-size:26px;margin-bottom:6px;">🌐</div>
       <div style="font-size:10px;font-weight:800;color:#7a8fa6;text-transform:uppercase;letter-spacing:1.5px;margin-bottom:14px;">Conectar Banco da Rede</div>
 
-      <!-- Caminho do arquivo -->
-      <div style="text-align:left;margin-bottom:12px;">
-        <div style="font-size:9px;font-weight:700;color:#a0aec0;text-transform:uppercase;letter-spacing:0.8px;margin-bottom:4px;">Pasta do Sistema (escolha esta pasta)</div>
-        <div style="display:flex;border:1.5px solid #d0d8e4;border-radius:7px;overflow:hidden;background:#fff;">
-          <input type="text" id="db-path-txt" readonly value="R:\GLOBAL\R.A - MMT-WH-PCM-PD-RP-QC\02 - BD Solda"
-            style="flex:1;padding:7px 10px;font-size:10px;font-family:monospace;font-weight:600;color:#344963;background:#f4f6f9;border:none;outline:none;min-width:0;">
-          <button onclick="copyDbPath()" title="Copiar caminho"
-            style="background:#e2e8f0;border:none;border-left:1.5px solid #d0d8e4;padding:7px 12px;cursor:pointer;color:#344963;font-size:13px;transition:background 0.15s;"
-            onmouseover="this.style.background='#cbd5e0'" onmouseout="this.style.background='#e2e8f0'">📋</button>
-        </div>
-      </div>
-
-      <!-- Botão de reconexão (escondido até existir arquivo lembrado) -->
-      <button id="db-btn-reconectar" onclick="reconectarBanco()"
-        style="display:none;width:100%;padding:10px 14px;margin-bottom:8px;background:#16a34a;color:#fff;border:none;border-radius:8px;font-size:12px;font-weight:700;font-family:inherit;cursor:pointer;letter-spacing:0.3px;">
-        ⚡ Reconectar Banco (última pasta usada)
-      </button>
-
-      <!-- Botão selecionar arquivo -->
+      <!-- v13.2: UM botão só. O endereço da pasta fica no código (vai sozinho para o Ctrl+V). -->
       <button id="db-btn-el" onclick="selectDB()"
         style="width:100%;padding:10px 14px;background:#0d1b2e;color:#fff;border:none;border-radius:8px;font-size:12px;font-weight:700;font-family:inherit;cursor:pointer;letter-spacing:0.3px;">
-        📂 Selecionar Pasta do Sistema
+        🔌 Conectar Sistema
       </button>
+      <div id="db-erro-pasta" style="display:none;margin-top:10px;font-size:11px;font-weight:700;color:#c0392b;text-align:left;"></div>
     </div>
 
     <!-- Atalho na área de trabalho (v12.0) -->
@@ -1515,7 +1498,7 @@ textarea.fc{resize:vertical;min-height:75px;}
        quantidade reduzida ou cancelada, com aviso). Mais de 10 min sem rede: a líder confirma.
      - Migração automática: o JSON antigo da pasta vira <nome>_MIGRADO_<data>.bak.
    ═══════════════════════════════════════════════════════════════ */
-const VERSAO='v13.1';
+const VERSAO='v13.2';
 
 // ═══ DATABASE ═══
 let dbHandle=null, db=null, cu=null, _syncInt=null, _clockInt=null, _tab='';
@@ -2352,27 +2335,43 @@ async function desconectarBanco(){
   document.getElementById('login-screen').style.display='flex';
   toast('Banco desconectado. Selecione a pasta do sistema.','ok');
 }
-async function reconectarBanco(){
-  const dh=await _handleLembrado();
-  if(!dh||dh.kind!=='directory'){await _handleEsquecer();_reconectarUI(false);toast('Nenhuma pasta lembrada. Selecione a pasta do sistema.','err');return;}
-  try{if(!await _permissaoPasta(dh,true))return;await _concluirConexao(dh);}
-  catch(e){await _handleEsquecer();_reconectarUI(false);toast('Não foi possível reconectar. Selecione a pasta do sistema.','err');}
-}
+// ═══ CONEXÃO DE PASTA EM 1 CLIQUE (v13.2 · mesmo esquema do Spare Parts) ═══
+const PASTA_FIXA='C:\\Guilherme Fernandes Local Disk (C)\\2 - Fábrica\\Sistemas\\Solda - teste';
+function _erroPasta(msg){const e=document.getElementById('db-erro-pasta');if(e){e.style.display=msg?'block':'none';e.textContent=msg||'';}else if(msg)alert(msg);}
+async function reconectarBanco(){return selectDB();}
+// Ao abrir a página (sem clique): se a permissão já está liberada, conecta sozinho
 async function _tentarReconexaoAutomatica(){
   if(!window.showDirectoryPicker||!window.indexedDB)return;
   const dh=await _handleLembrado();
   if(!dh)return;
   if(dh.kind!=='directory'){await _handleEsquecer();return;}   // era o arquivo JSON da v12
-  try{if(await _permissaoPasta(dh,false)&&await _concluirConexao(dh,true))return;}catch(e){}
-  _reconectarUI(true);
+  try{if(await _permissaoPasta(dh,false))await _concluirConexao(dh,true);}catch(e){}
 }
+// O ÚNICO botão: "Conectar Sistema"
 async function selectDB(){
-  if(!window.showDirectoryPicker){toast('Use o Google Chrome ou o Microsoft Edge para conectar a pasta da rede.','err');return;}
-  try{
-    const dh=await window.showDirectoryPicker({id:'tpv-solda-pasta',mode:'readwrite'});
-    if(!await _permissaoPasta(dh,true)){toast('Sem permissão de gravação na pasta.','err');return;}
-    await _concluirConexao(dh);
-  }catch(e){if(e.name!=='AbortError')toast('Erro ao abrir a pasta: '+e.message,'err');}
+  if(dbHandle)return;
+  if(!window.showDirectoryPicker){_erroPasta('Use o Google Chrome ou o Microsoft Edge.');return;}
+  _erroPasta('');
+  const lembrada=await _handleLembrado();
+  if(lembrada&&lembrada.kind==='directory'){
+    try{
+      if(!await _permissaoPasta(lembrada,true))return;               // negou: mantém a pasta e fica no botão
+      if(await PASTA.confirmacao(lembrada)){await _concluirConexao(lembrada);return;}
+    }catch(e){/* pasta movida/renomeada/rede fora */}
+    await _handleEsquecer();                                         // esquece e abre a janela
+  }
+  try{await navigator.clipboard.writeText(PASTA_FIXA);}catch(e){}  // pronto para o Ctrl+V
+  while(true){
+    let dh;
+    try{dh=await window.showDirectoryPicker({id:'tpv-solda-pasta',mode:'read'});}
+    catch(e){if(e.name!=='AbortError')_erroPasta('Não abriu a janela: '+e.message+'. Clique de novo.');return;}
+    if(await PASTA.confirmacao(dh)){
+      if(!await _permissaoPasta(dh,true)){_erroPasta('Permissão de gravação negada. Clique em Conectar Sistema de novo.');return;}
+      await _concluirConexao(dh);return;
+    }
+    if(!confirm('A pasta "'+dh.name+'" NÃO é a pasta do sistema.'+(dh.name.toLowerCase()==='dados'?'\nNão entre em "dados": escolha a pasta de CIMA.':'')+
+      '\n\nEscolha:\n'+PASTA_FIXA+'\n(o endereço já está no Ctrl+V: cole na barra da janela e dê Enter)\n\nNada foi alterado. Tentar de novo?'))return;
+  }
 }
 
 function dbLoaded(name){
@@ -2406,12 +2405,6 @@ function criarAtalho(){
   }
 }
 
-function copyDbPath(){
-  const path='R:\\GLOBAL\\R.A - MMT-WH-PCM-PD-RP-QC\\02 - BD Solda';
-  navigator.clipboard.writeText(path).then(()=>toast('Caminho copiado!','ok')).catch(()=>{
-    const inp=document.getElementById('db-path-txt');if(inp){inp.select();document.execCommand('copy');}toast('Caminho copiado!','ok');
-  });
-}
 
 function save(){return DB.push();}
 function setSync(t){const e=document.getElementById('tb-sync');if(e)e.textContent=t;const d=document.querySelector('.tb-sync');if(d)d.classList.toggle('err',/erro|sem conex|não salvo/i.test(t));}

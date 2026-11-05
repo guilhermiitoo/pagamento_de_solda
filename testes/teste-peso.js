@@ -1,6 +1,6 @@
 const {carregar}=require('./harness.js');
 const RAIZ=require('path').join(__dirname,'..');
-const c=carregar(RAIZ+'/TPV_SolderControl_v13_1.html');
+const c=carregar(RAIZ+'/TPV_SolderControl_v13_2.html');
 let ok=0,fail=0;
 const eq=(nome,got,exp)=>{const bom=Math.abs(got-exp)<1e-6;
   console.log((bom?'  ok  ':'  FALHA')+'  '+nome.padEnd(34)+' => '+got+(bom?'':'   (esperado '+exp+')'));
