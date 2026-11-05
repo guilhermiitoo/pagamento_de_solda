@@ -2345,6 +2345,10 @@ async function _permissaoPasta(dh,pedir){
   return p==='granted';
 }
 async function _concluirConexao(dh,silencioso){
+  if(!_nomePastaOk(dh)){
+    if(!silencioso)toast('❌ Pasta errada: "'+dh.name+'". O sistema só funciona na pasta '+PASTA_FIXA+'. Nada foi criado.','err',12000);
+    return false;
+  }
   // (A) sem o arquivo de confirmação a pasta é recusada e NADA é criado
   if(!await PASTA.confirmacao(dh)){
     if(!silencioso)toast('❌ A pasta "'+dh.name+'" não é a pasta do Sistema de Solda: falta o arquivo '+PASTA.CONFIRMACAO+' com {"sistema":"SOLDA_MMT"}. Nada foi criado. Peça ao MMT a pasta correta.','err',12000);
@@ -2418,7 +2422,11 @@ async function desconectarBanco(){
   toast('Banco desconectado. Selecione a pasta do sistema.','ok');
 }
 // ═══ CONEXÃO DE PASTA EM 1 CLIQUE (v13.2 · mesmo esquema do Spare Parts) ═══
-const PASTA_FIXA='C:\\Guilherme Fernandes Local Disk (C)\\2 - Fábrica\\Sistemas\\Solda - teste';
+const PASTA_FIXA='R:\\GLOBAL\\R.A - MMT-WH-PCM-PD-RP-QC\\01 - SISTEMA DE REQUISIÇÃO DE SOLDA';
+// Trava do endereço: o navegador só informa o NOME da pasta escolhida (nunca o caminho).
+// Então a pasta só é aceita com este nome E com o arquivo SOLDA_PASTA_DO_SISTEMA.json dentro.
+const PASTA_NOME=PASTA_FIXA.split('\\').pop();
+const _nomePastaOk=dh=>String(dh&&dh.name||'').trim().toLowerCase()===PASTA_NOME.toLowerCase();
 function _erroPasta(msg){const e=document.getElementById('db-erro-pasta');if(e){e.style.display=msg?'block':'none';e.textContent=msg||'';}else if(msg)alert(msg);}
 async function reconectarBanco(){return selectDB();}
 // Ao abrir a página (sem clique): se a permissão já está liberada, conecta sozinho
@@ -2438,7 +2446,7 @@ async function selectDB(){
   if(lembrada&&lembrada.kind==='directory'){
     try{
       if(!await _permissaoPasta(lembrada,true))return;               // negou: mantém a pasta e fica no botão
-      if(await PASTA.confirmacao(lembrada)){await _concluirConexao(lembrada);return;}
+      if(_nomePastaOk(lembrada)&&await PASTA.confirmacao(lembrada)){await _concluirConexao(lembrada);return;}
     }catch(e){/* pasta movida/renomeada/rede fora */}
     await _handleEsquecer();                                         // esquece e abre a janela
   }
@@ -2447,12 +2455,12 @@ async function selectDB(){
     let dh;
     try{dh=await window.showDirectoryPicker({id:'tpv-solda-pasta',mode:'read'});}
     catch(e){if(e.name!=='AbortError')_erroPasta('Não abriu a janela: '+e.message+'. Clique de novo.');return;}
-    if(await PASTA.confirmacao(dh)){
+    if(_nomePastaOk(dh)&&await PASTA.confirmacao(dh)){
       if(!await _permissaoPasta(dh,true)){_erroPasta('Permissão de gravação negada. Clique em Conectar Sistema de novo.');return;}
       await _concluirConexao(dh);return;
     }
     let temDados=false;try{await dh.getDirectoryHandle('dados');temDados=true;}catch(e){}
-    if(dh.name.toLowerCase()!=='dados'&&!temDados){
+    if(_nomePastaOk(dh)&&!temDados){
       alert('A pasta "'+dh.name+'" ainda NÃO está preparada para o sistema.\n\nFalta o arquivo '+PASTA.CONFIRMACAO+' dentro dela, com o conteúdo:\n{"sistema":"SOLDA_MMT"}\n\nEsse arquivo é colocado à mão, uma vez só, pelo responsável do sistema (MMT). Nada foi alterado.');return;
     }
     if(!confirm('A pasta "'+dh.name+'" NÃO é a pasta do sistema.'+(dh.name.toLowerCase()==='dados'?'\nNão entre em "dados": escolha a pasta de CIMA.':'')+
@@ -3394,7 +3402,7 @@ async function confirmarReq(){
     const ag=agora();
     const solId=novoId('s');
     db.solicitacoes.push({id:solId,ts:ag.ts,data:ag.data,hora:ag.hora,status:'PENDENTE',
-      lider:cu.nome,loginLider:cu.login,linha:ln,op,modelo:mod,qty:qtyReal,
+      lider:cu.nome,loginLider:cu.login,linha:ln,op,modelo:mod,qty:qtyReal,pc:PASTA.pcId(),
       chassi,qtdKit,invoice,pullList,planoModelo,reservados});
     // Grava também no Histórico (tipo SOLICITACAO) — não movimenta estoque, é só rastreio
     reservados.forEach(r=>{
@@ -3644,7 +3652,8 @@ async function aceitarSolicLote(){
 // Pedido feito sem rede: a baixa acontece quando a rede volta.
 let _baixaRodando=false;
 function _solicParaBaixa(){
-  return (db.solicitacoes||[]).filter(s=>s.status==='PENDENTE'&&!DB.naoEnviadas[s.id]&&(s.reservados||[]).length);
+  // cada PC baixa só os pedidos que ELE criou (pedido antigo, sem PC, qualquer um baixa)
+  return (db.solicitacoes||[]).filter(s=>s.status==='PENDENTE'&&!DB.naoEnviadas[s.id]&&(s.reservados||[]).length&&(!s.pc||s.pc===PASTA.pcId()));
 }
 async function baixaAutomatica(){
   if(_baixaRodando||!db||!dbHandle||DB.offline||DB.sujo||DB.writing||DB.fila||DB.mutando>0)return null;

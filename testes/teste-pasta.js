@@ -67,7 +67,7 @@ const resumo=d=>JSON.stringify({e:d.estoque,u:d.emUso,s:d.solicitacoes,h:d.histo
 
 (async()=>{
   const banco=JSON.parse(fs.readFileSync(process.argv[2]||__dirname+'/../ARQUIVO LIMPO 10-06 .json','utf8'));
-  const raiz=new DH('BD Solda');
+  const raiz=new DH('01 - SISTEMA DE REQUISIÇÃO DE SOLDA');
   console.log('1) Migração do JSON real');
   const A=novoPC('PC-A');
   const put=(nome,txt)=>raiz.files.set(nome,{b:Buffer.from(txt,'utf8'),mt:Date.now()});

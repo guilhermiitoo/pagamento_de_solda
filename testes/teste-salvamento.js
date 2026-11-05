@@ -41,13 +41,17 @@ BANCO.solicitacoes=(BANCO.solicitacoes||[]).map(s=>s.status==='PENDENTE'?{...s,s
   await A.evaluate(async txt=>{
     const r=await navigator.storage.getDirectory();
     for await(const [n] of r.entries())await r.removeEntry(n,{recursive:true});
-    const dh=await r.getDirectoryHandle('BD_Solda',{create:true});
+    const dh=await r.getDirectoryHandle('01 - SISTEMA DE REQUISIÇÃO DE SOLDA',{create:true});
     const w=await (await dh.getFileHandle('BANCO_SOLDA.json',{create:true})).createWritable();await w.write(txt);await w.close();
   },JSON.stringify(BANCO));
-  const semConf=await A.evaluate(async()=>{const dh=await (await navigator.storage.getDirectory()).getDirectoryHandle('BD_Solda');
+  const semConf=await A.evaluate(async()=>{const dh=await (await navigator.storage.getDirectory()).getDirectoryHandle('01 - SISTEMA DE REQUISIÇÃO DE SOLDA');
     const r=await _concluirConexao(dh);const nomes=[];for await(const [n] of dh.entries())nomes.push(n);return{r,nomes};});
   ok(semConf.r===false&&!semConf.nomes.includes('dados'),'pasta SEM o arquivo de confirmação é recusada e nada é criado');
-  const mig=await A.evaluate(async()=>{const dh=await (await navigator.storage.getDirectory()).getDirectoryHandle('BD_Solda');
+  const nomeErrado=await A.evaluate(async()=>{const r=await navigator.storage.getDirectory();const dh=await r.getDirectoryHandle('Outra pasta',{create:true});
+    const w=await (await dh.getFileHandle('SOLDA_PASTA_DO_SISTEMA.json',{create:true})).createWritable();await w.write('{"sistema":"SOLDA_MMT"}');await w.close();
+    const ok=await _concluirConexao(dh);const n=[];for await(const [x] of dh.entries())n.push(x);return{ok,n};});
+  ok(nomeErrado.ok===false&&!nomeErrado.n.includes('dados'),'pasta com OUTRO nome é recusada mesmo com o arquivo de confirmação (trava do endereço)');
+  const mig=await A.evaluate(async()=>{const dh=await (await navigator.storage.getDirectory()).getDirectoryHandle('01 - SISTEMA DE REQUISIÇÃO DE SOLDA');
     const w=await (await dh.getFileHandle('SOLDA_PASTA_DO_SISTEMA.json',{create:true})).createWritable();await w.write('{"sistema":"SOLDA_MMT"}');await w.close();
     const r=await _concluirConexao(dh);const nomes=[];for await(const [n] of dh.entries())nomes.push(n);
     return{r,nomes,h:db.historico.length,s:db.solicitacoes.length,u:db.usuarios.length,e:JSON.stringify(db.estoque)};});
@@ -59,7 +63,7 @@ BANCO.solicitacoes=(BANCO.solicitacoes||[]).map(s=>s.status==='PENDENTE'?{...s,s
 
   const B=await abrir('PC-B');
   for(const p of [A,B])await p.evaluate(async()=>{
-    if(!dbHandle){const dh=await (await navigator.storage.getDirectory()).getDirectoryHandle('BD_Solda');await _concluirConexao(dh);}
+    if(!dbHandle){const dh=await (await navigator.storage.getDirectory()).getDirectoryHandle('01 - SISTEMA DE REQUISIÇÃO DE SOLDA');await _concluirConexao(dh);}
     cu=db.usuarios.find(u=>u.setor!=='MMT')||db.usuarios[0];startApp();});
   ok((await B.evaluate(()=>db.estoque.TTX.length))===10,'PC-B abre a mesma pasta e vê os tubos');
 
