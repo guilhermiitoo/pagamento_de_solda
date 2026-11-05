@@ -7,7 +7,7 @@
 const fs=require('fs'),path=require('path'),http=require('http');
 const {chromium}=require('playwright');
 const RAIZ=path.join(__dirname,'..');
-const HTML=path.resolve(process.argv[3]||path.join(RAIZ,'TPV_SolderControl_v13_3.html'));
+const HTML=path.resolve(process.argv[3]||path.join(RAIZ,'TPV_SolderControl_v12_1.html'));
 const BANCO=JSON.parse(fs.readFileSync(process.argv[2]||path.join(RAIZ,'ARQUIVO LIMPO 10-06 .json'),'utf8'));
 
 let falhas=0;
