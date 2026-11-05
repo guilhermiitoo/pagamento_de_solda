@@ -1137,6 +1137,7 @@ tbody tr:hover{background:#eef5fc;}
           <div class="fxc g8">
             <button class="btn bo2 btn-sm" onclick="expXLSXBackup()">📊 Exportar Excel (Backup Histórico)</button>
             <button class="btn bs btn-sm" onclick="exportCleanJSON()">🧹 Exportar JSON Limpo</button>
+            <button class="btn bn btn-sm" onclick="importarJsonAntigo()">📥 Importar JSON antigo (banco único)</button>
             <button class="btn bo2 btn-sm" onclick="criarAtalho()">🖥️ Criar atalho na Área de Trabalho</button>
           </div>
           <div style="font-size:11px;color:#56677c;margin-top:8px;line-height:1.5;">Para apagar registros antigos, use a aba <b>Limpeza do Banco</b>.</div>
@@ -4364,6 +4365,65 @@ function expXLSXBackup(subset,prefixo){
 }
 
 // ── Exportar JSON Limpo (sem histórico) ──
+// ═══ IMPORTAR JSON ANTIGO (v13.2) ═══
+// Junta os dados de um banco no formato antigo (JSON único) ao banco atual da pasta.
+// Só ACRESCENTA o que falta: nada que já existe é apagado ou sobrescrito.
+// O JSON pode ser colocado na pasta do sistema: a janela já abre nela.
+async function importarJsonAntigo(){
+  if(!cu||cu.setor!=='MMT'){toast('Somente o MMT pode importar dados.','err');return;}
+  let txt,nome;
+  try{
+    if(window.showOpenFilePicker){
+      const op={types:[{description:'Banco JSON',accept:{'application/json':['.json']}}],multiple:false};
+      if(PASTA.raiz)op.startIn=PASTA.raiz;
+      const[fh]=await window.showOpenFilePicker(op);const f=await fh.getFile();txt=await f.text();nome=f.name;
+    }else{
+      const f=await new Promise(res=>{const i=document.createElement('input');i.type='file';i.accept='.json';i.onchange=()=>res(i.files[0]);i.click();});
+      if(!f)return;txt=await f.text();nome=f.name;
+    }
+  }catch(e){if(e.name!=='AbortError')toast('Não consegui abrir o arquivo: '+e.message,'err');return;}
+  let v;try{v=JSON.parse(txt);}catch(e){toast('O arquivo não é um JSON válido.','err');return;}
+  const er=_validarEstruturaBanco(v);if(er){toast('❌ JSON recusado: '+er,'err',10000);return;}
+  v=normalizarDB(v);
+  await DB.pullNow();
+  const r=_planoImportacao(db,v);
+  const tot=r.hist+r.sol+r.usu+r.tubos+r.uso+r.outros;
+  if(!tot){DB._fimOp();toast('Nada a importar: tudo de "'+nome+'" já está no banco.','ok',8000);return;}
+  if(!confirm('IMPORTAR "'+nome+'"\n\nSerão ACRESCENTADOS ao banco atual:\n'+
+    '• '+r.hist+' registro(s) de histórico\n• '+r.sol+' solicitação(ões)\n• '+r.usu+' usuário(s)\n'+
+    '• '+r.tubos+' tubo(s) no estoque\n• '+r.uso+' tubo(s) em uso nas linhas\n• '+r.outros+' outro(s) (modelos, linhas, correções, limpezas)\n\n'+
+    'Nada que já existe será apagado ou alterado.\n\nImportar agora?')){DB._fimOp();return;}
+  _aplicarImportacao(db,v);
+  const res=await save();
+  if(!res||!res.ok)return;
+  toast('✅ Importado de "'+nome+'": '+tot+' registro(s) acrescentado(s).','ok',10000);
+  refreshView();
+}
+function _planoImportacao(a,v){
+  const ids=new Set((a.historico||[]).map(h=>h.id)),sol=new Set((a.solicitacoes||[]).map(s=>s.id)),usu=new Set((a.usuarios||[]).map(u=>u.login));
+  const lpns=new Set();Object.values(a.estoque||{}).forEach(l=>(l||[]).forEach(t=>lpns.add(t.lpn)));Object.values(a.emUso||{}).forEach(l=>(l||[]).forEach(t=>lpns.add(t.lpn)));
+  const saiu=new Set((a.historico||[]).filter(h=>h.tipo==='SAIDA'||!h.tipo).map(h=>h.lpn));
+  let tubos=0,uso=0,outros=0;
+  Object.values(v.estoque||{}).forEach(l=>(l||[]).forEach(t=>{if(!lpns.has(t.lpn)&&!saiu.has(t.lpn))tubos++;}));
+  Object.values(v.emUso||{}).forEach(l=>(l||[]).forEach(t=>{if(!lpns.has(t.lpn))uso++;}));
+  const m=new Set((a.modelos||[]).map(x=>x.prefixo)),ln=new Set(a.linhas||[]),c=new Set((a.correcoes||[]).map(x=>x.id)),lp=new Set((a.limpezas||[]).map(x=>x.id));
+  outros=(v.modelos||[]).filter(x=>!m.has(x.prefixo)).length+(v.linhas||[]).filter(x=>!ln.has(x)).length+(v.correcoes||[]).filter(x=>!c.has(x.id)).length+(v.limpezas||[]).filter(x=>!lp.has(x.id)).length;
+  return{hist:(v.historico||[]).filter(h=>!ids.has(h.id)).length,sol:(v.solicitacoes||[]).filter(s=>!sol.has(s.id)).length,usu:(v.usuarios||[]).filter(u=>!usu.has(u.login)).length,tubos,uso,outros};
+}
+function _aplicarImportacao(a,v){
+  const add=(lista,novos,key)=>{const k=new Set(lista.map(key));novos.forEach(x=>{if(!k.has(key(x))){lista.push(x);k.add(key(x));}});};
+  const lpns=new Set();Object.values(a.estoque||{}).forEach(l=>(l||[]).forEach(t=>lpns.add(t.lpn)));Object.values(a.emUso||{}).forEach(l=>(l||[]).forEach(t=>lpns.add(t.lpn)));
+  const saiu=new Set((a.historico||[]).filter(h=>h.tipo==='SAIDA'||!h.tipo).map(h=>h.lpn));
+  add(a.historico,v.historico||[],h=>h.id);a.historico.sort((x,y)=>(x.ts||0)-(y.ts||0));
+  add(a.solicitacoes,v.solicitacoes||[],s=>s.id);a.solicitacoes.sort((x,y)=>(x.ts||0)-(y.ts||0));
+  add(a.usuarios,v.usuarios||[],u=>u.login);add(a.modelos,v.modelos||[],m=>m.prefixo);add(a.linhas,v.linhas||[],l=>l);
+  add(a.correcoes,v.correcoes||[],c=>c.id);add(a.limpezas,v.limpezas||[],c=>c.id);
+  Object.keys(v.estoque||{}).forEach(m=>{(v.estoque[m]||[]).forEach(t=>{if(lpns.has(t.lpn)||saiu.has(t.lpn))return;(a.estoque[m]=a.estoque[m]||[]).push(t);lpns.add(t.lpn);});});
+  Object.keys(a.estoque||{}).forEach(m=>a.estoque[m].sort((x,y)=>(x.fifo??1e9)-(y.fifo??1e9)));
+  Object.keys(v.emUso||{}).forEach(l=>{(v.emUso[l]||[]).forEach(t=>{if(lpns.has(t.lpn))return;(a.emUso[l]=a.emUso[l]||[]).push(t);lpns.add(t.lpn);});});
+  if(v.fifoSeq&&v.fifoSeq._next)a.fifoSeq=Object.assign({},a.fifoSeq,{_next:Math.max(+(a.fifoSeq&&a.fifoSeq._next)||0,+v.fifoSeq._next||0)});
+  if(v.planoWH&&(v.planoWH.ts||0)>((a.planoWH&&a.planoWH.ts)||0))a.planoWH=v.planoWH;
+}
 function exportCleanJSON(){
   if(!db){toast('Nenhum banco carregado.','warn');return;}
   const clean=Object.assign({},db);
